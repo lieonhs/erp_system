@@ -1,0 +1,15 @@
+{
+  "name": "erp-rpa",
+  "private": true,
+  "version": "1.0.0",
+  "description": "ERP mini Finance, Purchasing, Logistik untuk usaha pemotongan ayam (Cloudflare Pages + D1)",
+  "scripts": {
+    "db:init:local": "wrangler d1 execute erp-rpa-db --local --file=schema.sql",
+    "db:init:remote": "wrangler d1 execute erp-rpa-db --remote --file=schema.sql",
+    "dev": "wrangler pages dev",
+    "deploy": "wrangler pages deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
