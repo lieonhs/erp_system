@@ -5,5 +5,5 @@ compatibility_date = "2026-11-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "erp-rpa-db"
-# Ganti dengan database_id dari: npx wrangler d1 create erp-rpa-db
-database_id = "00000000-0000-0000-0000-000000000000"
+# D1 production (APAC)
+database_id = "5888b9ac-35c5-4858-986b-8854ead1271e"
