@@ -109,8 +109,8 @@ const Store = {
     this.localPersist();
   },
 };
-const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', adj: 'ADJ', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV' };
-const DATED = new Set(['po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset']);
+const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', adj: 'ADJ', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV', price: 'HRG' };
+const DATED = new Set(['po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset', 'price']);
 function localNextNo(kind, date) {
   const ym = (date || localDate()).slice(2, 7).replace('-', '');
   const pre = `${PREFIX[kind]}-${ym}-`;
@@ -128,6 +128,15 @@ function checkLock(kind, date) {
 const S = { recs: [], map: new Map(), unit: 'all', from: '', to: '', E: null, tab: {} };
 const K = k => S.recs.filter(r => r.kind === k);
 const byId = id => S.map.get(id);
+// Harga dinamis: harga terakhir di Harga Harian pada/sebelum tanggal, fallback harga acuan master
+function priceOn(itemId, date) {
+  let best = null;
+  for (const r of S.recs) if (r.kind === 'price' && (!date || r.date <= date) && (!best || r.date > best.date || (r.date === best.date && (r.created_at || '') > (best.created_at || '')))) {
+    if ((r.data.lines || []).some(l => l.item_id === itemId && num(l.price) > 0)) best = r;
+  }
+  if (best) return num(best.data.lines.find(l => l.item_id === itemId && num(l.price) > 0).price);
+  return num((byId(itemId) || { data: {} }).data.price);
+}
 const doIdsOf = inv => (inv.data.dos || []).map(x => x.do_id).filter(Boolean);
 const invoiceOfDO = doId => S.recs.find(r => r.kind === 'so' && doIdsOf(r).includes(doId));
 function nextCode(kind, prefix, extra = []) {
@@ -228,7 +237,7 @@ function engine() {
       const overhead = num(d.overhead);
       const total = r2(liveCost + supCost + overhead);
       const outs = (d.outputs || []).filter(l => l.item_id && num(l.kg) > 0);
-      const w = outs.map(l => num(l.kg) * num((byId(l.item_id) || { data: {} }).data.price));
+      const w = outs.map(l => num(l.kg) * priceOn(l.item_id, r.date));
       let sw = w.reduce((a, b) => a + b, 0);
       const useKg = sw <= 0; if (useKg) sw = outs.reduce((a, l) => a + num(l.kg), 0);
       const shares = outs.map((l, i) => sw > 0 ? (useKg ? num(l.kg) : w[i]) / sw : 0);
@@ -498,7 +507,7 @@ const NAV = [
   ['Ringkasan', [['dashboard', 'Dashboard'], ['analisis', 'Analisis Kinerja & Modal']]],
   ['Purchasing', [['po', 'Purchase Order'], ['gr', 'Penerimaan Barang'], ['supplier', 'Kinerja Supplier']]],
   ['Logistik', [['prod', 'Pemotongan / Produksi'], ['stok', 'Stok Persediaan'], ['kartu', 'Kartu Stok'], ['adj', 'Stok Opname & Penyesuaian'], ['kirim', 'Pengiriman'], ['armada', 'Armada & Driver']]],
-  ['Penjualan', [['do', 'Delivery Order / Surat Jalan'], ['so', 'Invoice Penjualan']]],
+  ['Penjualan', [['harga', 'Harga Harian & Margin'], ['do', 'Delivery Order / Surat Jalan'], ['so', 'Invoice Penjualan']]],
   ['Finance', [['kas', 'Kas & Bank'], ['hutang', 'Hutang Supplier'], ['piutang', 'Piutang Customer'], ['aset', 'Aset Tetap & Penyusutan'], ['jv', 'Jurnal Umum'], ['ledger', 'Buku Besar'], ['lapkeu', 'Laporan Keuangan']]],
   ['Master', [['barang', 'Barang & Produk'], ['vendor', 'Vendor / Supplier'], ['customer', 'Customer'], ['unit', 'Unit Usaha'], ['akun', 'Bagan Akun'], ['setting', 'Pengaturan & Backup']]],
 ];
@@ -613,7 +622,7 @@ FORMS.po = rec => openForm({
     { k: 'note', label: 'Catatan', type: 'textarea', wide: true },
   ],
   tables: [{ k: 'lines', label: 'Barang dipesan', cols: [
-    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(), w: '34%' },
+    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(), w: '34%', onChange: (tr, v) => { const p = tr.querySelector('[name="l:price"]'); if (v && !num(p.value)) p.value = priceOn(v, $('#frm').elements['f:date'].value) || ''; } },
     { k: 'ekor', label: 'Ekor', type: 'number' }, { k: 'kg', label: 'Kg / Qty', type: 'number' },
     { k: 'price', label: 'Harga / kg (Rp)', type: 'number' },
     { k: 'sub', label: 'Subtotal', calc: r => rp(num(r.kg) * num(r.price)) },
@@ -649,7 +658,7 @@ FORMS.gr = rec => openForm({
   ],
   extraBtn: rec ? `<button type="button" class="ghost" onclick="printBTB('${rec.id}',false)">Cetak Bukti Barang Masuk</button><button type="button" class="ghost" onclick="printBTB('${rec.id}',true)">+ harga</button>` : '',
   tables: [{ k: 'lines', label: 'Rincian timbang', cols: [
-    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(), w: '24%' },
+    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(), w: '24%', onChange: (tr, v) => { const p = tr.querySelector('[name="l:price"]'); if (v && !num(p.value)) p.value = priceOn(v, $('#frm').elements['f:date'].value) || ''; } },
     { k: 'koli', label: 'Keranjang/koli', type: 'number' },
     { k: 'ekor_farm', label: 'Ekor kirim', type: 'number' }, { k: 'kg_farm', label: 'Kg kandang', type: 'number' },
     { k: 'ekor', label: 'Ekor hidup diterima', type: 'number' }, { k: 'dead', label: 'Mati (DOA)', type: 'number' },
@@ -791,7 +800,7 @@ function rebuildInvoiceLines() {
     if (!l.item_id) continue;
     const ex = rows.find(x => x.item_id === l.item_id);
     if (ex) { ex.kg = r2(num(ex.kg) + num(l.kg)); ex.ekor = num(ex.ekor) + num(l.ekor); }
-    else rows.push({ item_id: l.item_id, ekor: num(l.ekor) || '', kg: num(l.kg), price: prices[l.item_id] || (byId(l.item_id) || { data: {} }).data.price || '' });
+    else rows.push({ item_id: l.item_id, ekor: num(l.ekor) || '', kg: num(l.kg), price: prices[l.item_id] || priceOn(l.item_id, frm.elements['f:date'].value) || '' });
   }
   setRows('lines', rows);
 }
@@ -814,7 +823,7 @@ FORMS.so = rec => openForm({
       { k: 'info', label: 'Status kirim', calc: r => { const d = byId(r.do_id); return d ? DELIV[d.data.delivery_status || 'pending'][0] : ''; } } ] },
     { k: 'lines', label: '2. Barang ditagih (berat & harga bisa disesuaikan dengan timbang penerima)', cols: [
       { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(['product', 'byproduct', 'live', 'other']), w: '36%',
-        onChange: (tr, v) => { const it = byId(v); const p = tr.querySelector('[name="l:price"]'); if (it && !num(p.value)) p.value = it.data.price || ''; } },
+        onChange: (tr, v) => { const p = tr.querySelector('[name="l:price"]'); if (v && !num(p.value)) p.value = priceOn(v, $('#frm').elements['f:date'].value) || ''; } },
       { k: 'ekor', label: 'Ekor', type: 'number' }, { k: 'kg', label: 'Kg / Qty', type: 'number' }, { k: 'price', label: 'Harga/kg', type: 'number' },
       { k: 'sub', label: 'Subtotal', calc: r => rp(r.kg * r.price) } ] },
   ],
@@ -1156,6 +1165,72 @@ FORMS.partner = (rec, preset) => {
 FORMS.vendor = () => FORMS.partner(null, 'supplier');
 FORMS.customer = () => FORMS.partner(null, 'customer');
 
+// ---- Harga harian & kalkulator margin ----
+function priceCol(it) { const n = (it.data.name || '').toLowerCase(); const c = it.data.category;
+  return c === 'live' ? 'lb' : c === 'product' ? 'karkas' : /ati|ampela/.test(n) ? 'ati' : /ceker/.test(n) ? 'ceker' : /kepala|leher/.test(n) ? 'kepala' : /usus/.test(n) ? 'usus' : null; }
+function sparkline(vals, color) {
+  const v = vals.filter(x => x > 0); if (v.length < 2) return '<span class="muted">butuh ≥ 2 data</span>';
+  const mn = Math.min(...v), mx = Math.max(...v), W = 260, H = 50;
+  const pts = v.map((x, i) => `${(i / (v.length - 1) * W).toFixed(1)},${(H - (mx === mn ? H / 2 : (x - mn) / (mx - mn) * (H - 6) + 3)).toFixed(1)}`).join(' ');
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}"/></svg><div class="note">min ${rp(mn)} · maks ${rp(mx)} · terakhir ${rp(v[v.length - 1])}</div>`;
+}
+PAGES.harga = () => {
+  const sheets = K('price').filter(inUnit).sort((a, b) => a.date.localeCompare(b.date) || (a.created_at || '').localeCompare(b.created_at || ''));
+  const its = items(['live', 'product', 'byproduct']).filter(i => priceCol(i) || i.data.category !== 'byproduct');
+  const today = S.to || localDate();
+  const lb = items('live')[0], kk = items('product')[0];
+  // data aktual 30 hari terakhir dari aplikasi
+  const from30 = addDays(today, -30);
+  const prods = K('prod').filter(r => inUnit(r) && r.date >= from30 && r.date <= today).map(r => S.E.cost[r.id]).filter(Boolean);
+  const inKg = prods.reduce((a, c) => a + c.inKg, 0), mainKg = prods.reduce((a, c) => a + c.mainKg, 0);
+  const rend = inKg ? mainKg / inKg : 0.70;
+  let byKg = 0; if (inKg) for (const r of K('prod').filter(r => inUnit(r) && r.date >= from30 && r.date <= today)) for (const l of r.data.outputs || []) { const it = byId(l.item_id); if (it && it.data.category === 'byproduct') byKg += num(l.kg) * priceOn(l.item_id, today); }
+  const byPerKg = inKg ? byKg / inKg : 0;
+  const ovh = prods.reduce((a, c) => a + c.overhead + c.supCost, 0); const ovhPerKgIn = inKg ? ovh / inKg : 0;
+  const grs = K('gr').filter(r => inUnit(r) && r.date >= from30 && r.date <= today); let kf = 0, kr = 0;
+  for (const g of grs) for (const l of g.data.lines || []) if (num(l.kg_farm) > 0) { kf += num(l.kg_farm); kr += num(l.kg); }
+  const susut = kf ? (kf - kr) / kf : 0.02;
+  const pLB = lb ? priceOn(lb.id, today) : 0, pK = kk ? priceOn(kk.id, today) : 0;
+  const costIn = pLB / (1 - susut);                      // biaya per kg ayam yang benar-benar masuk RPA
+  const hppK = rend ? (costIn + ovhPerKgIn - byPerKg) / rend : 0;
+  const target = num(S.tab.hargaTarget || 5) / 100;
+  const minPrice = hppK / (1 - target);
+  const src = inKg ? `data pemotongan ${fmt(inKg, 0)} kg 30 hari terakhir` : 'belum ada data pemotongan — pakai asumsi rendemen 70%, susut 2%';
+  const matrix = sheets.slice(-30).reverse().map(r => `<tr class="click" data-edit="${r.id}"><td>${r.date}</td>${its.map(i => { const l = (r.data.lines || []).find(x => x.item_id === i.id); return td(l && num(l.price) ? rp(l.price) : '', 1); }).join('')}<td>${esc(r.data.source || '')}</td></tr>`);
+  return `<div class="bar"><button data-new="price">+ Harga hari ini</button><button class="ghost" id="priceCsv">Salin untuk Excel</button><span class="sp"></span>
+    <a href="https://panelharga.badanpangan.go.id/" target="_blank" rel="noopener">Panel Harga Bapanas ↗</a>&nbsp;·&nbsp;<a href="https://www.bi.go.id/hargapangan" target="_blank" rel="noopener">PIHPS BI ↗</a></div>
+  <div class="grid2"><div class="card"><h3>Kalkulator margin hari ini</h3>
+    ${table(['Komponen', ['Nilai', 1]], [
+      `<tr><td>Harga livebird beli ${lb ? '(' + esc(lb.data.name) + ')' : ''}</td>${td(rp(pLB) + '/kg', 1)}</tr>`,
+      `<tr><td>Susut kandang → RPA</td>${td(pct(susut), 1)}</tr>`,
+      `<tr><td>Biaya per kg ayam diterima</td>${td(rp(costIn), 1)}</tr>`,
+      `<tr><td>+ Overhead & bahan pembantu per kg hidup</td>${td(rp(ovhPerKgIn), 1)}</tr>`,
+      `<tr><td>− Nilai produk sampingan per kg hidup</td>${td(rp(byPerKg), 1)}</tr>`,
+      `<tr><td>÷ Rendemen karkas</td>${td(pct(rend), 1)}</tr>`,
+      `<tr class="tot"><td>HPP karkas per kg</td>${td(rp(hppK), 1)}</tr>`,
+      `<tr><td>Harga jual karkas hari ini</td>${td(rp(pK), 1)}</tr>`,
+      `<tr class="tot"><td>Margin per kg karkas</td>${td(`<span class="${pK - hppK < 0 ? 'neg' : 'pos'}">${rp(pK - hppK)} (${pct(pK ? (pK - hppK) / pK : NaN)})</span>`, 1)}</tr>`,
+      `<tr><td>Harga jual minimum untuk margin <input id="hargaTarget" type="number" value="${target * 100}" style="width:60px">%</td>${td(`<b>${rp(minPrice)}</b>`, 1)}</tr>`,
+    ])}<p class="note">Sumber rendemen/susut/overhead: ${src}. Belum termasuk biaya tetap (gaji, sewa) — lihat menu Analisis untuk laba bersih.</p></div>
+    <div class="card"><h3>Tren 30 catatan terakhir</h3>
+      <div><b>Livebird</b><br>${sparkline(sheets.slice(-30).map(r => lb ? num(((r.data.lines || []).find(l => l.item_id === lb.id) || {}).price) : 0), '#c2410c')}</div><br>
+      <div><b>Karkas</b><br>${sparkline(sheets.slice(-30).map(r => kk ? num(((r.data.lines || []).find(l => l.item_id === kk.id) || {}).price) : 0), '#1d4ed8')}</div></div></div>
+  ${table(['Tanggal', ...its.map(i => [i.data.name, 1]), 'Sumber'], matrix, { id: 't-harga', empty: 'Belum ada harga harian. Klik "+ Harga hari ini".' })}
+  <p class="note"><b>Harga harian otomatis dipakai</b> sebagai harga default di PO, Penerimaan, dan Invoice (sesuai tanggal dokumen), serta untuk membagi biaya produksi ke tiap produk. Harga di dokumen yang sudah disimpan tidak berubah. Tombol "Salin untuk Excel" menyalin log harga dengan urutan kolom sheet <i>Harga Harian</i> di file model.</p>`;
+};
+FORMS.price = rec => openForm({
+  kind: 'price', title: 'Harga Harian', rec, defaults: { date: localDate(), unit_id: defaultUnit() },
+  fields: [{ k: 'date', label: 'Tanggal', type: 'date', req: true }, unitField(),
+    { k: 'source', label: 'Sumber harga', type: 'text', ph: 'mis. broker Pak X, grup WA Pinsar, cek pasar' }, { k: 'note', label: 'Catatan', type: 'text' }],
+  tables: [{ k: 'lines', label: 'Harga per kg (livebird = harga beli, produk = harga jual)', cols: [
+    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(['live', 'product', 'byproduct']), w: '40%' },
+    { k: 'price', label: 'Harga (Rp/kg)', type: 'number' },
+    { k: 'prev', label: 'Sebelumnya', calc: (r, h) => r.item_id ? rp(priceOn(r.item_id, addDays(h.date || localDate(), -1))) : '' },
+    { k: 'chg', label: 'Perubahan', calc: (r, h) => { const pv = r.item_id ? priceOn(r.item_id, addDays(h.date || localDate(), -1)) : 0; return pv && r.price ? pct((r.price - pv) / pv) : ''; } }] }],
+  onOpen: () => { if (!rec) setRows('lines', items(['live', 'product', 'byproduct']).filter(i => num(i.data.price) > 0 || priceOn(i.id, localDate()) > 0 || i.data.category !== 'byproduct').map(i => ({ item_id: i.id, price: priceOn(i.id, localDate()) || '' }))); },
+  validate: d => { if (!(d.lines || []).some(l => l.item_id && l.price > 0)) return 'Isi minimal satu harga'; d.lines = d.lines.filter(l => l.item_id && l.price > 0); },
+});
+
 // ---- Analisis kinerja, modal & termin ----
 const SEG_TERM = { pasar: [0, 3], resto: [7, 14], retail: [30, 45], distributor: [7, 14], lain: [0, 7] };
 PAGES.analisis = () => {
@@ -1379,6 +1454,13 @@ document.addEventListener('click', async e => {
   if (t.id === 'menuBtn') return $('#side').classList.toggle('open');
   if (t.id === 'seedBtn') return seedMaster().catch(handleErr);
   if (t.id === 'tokenBtn') return askToken();
+  if (t.id === 'priceCsv') {
+    const cols = ['lb', 'karkas', 'ati', 'ceker', 'kepala', 'usus'];
+    const lines = K('price').filter(inUnit).sort((a, b) => a.date.localeCompare(b.date)).map(r => { const v = {}; for (const l of r.data.lines || []) { const it = byId(l.item_id); const c = it && priceCol(it); if (c && !v[c]) v[c] = num(l.price); }
+      return [r.date, ...cols.map(c => v[c] || ''), (r.data.source || '').replace(/\t/g, ' ')].join('\t'); });
+    try { await navigator.clipboard.writeText(lines.join('\n')); toast(`${lines.length} baris disalin. Tempel di sel A5 sheet "Harga Harian".`); } catch { toast('Browser menolak akses clipboard', true); }
+    return;
+  }
   if (t.id === 'coBtn') {
     const prev = byId('setting-company'); const data = {};
     for (const k of ['name', 'phone', 'npwp', 'bank', 'address']) data[k] = $('#co_' + k).value.trim();
@@ -1401,6 +1483,7 @@ document.addEventListener('change', async e => {
   if (t.id === 'fromSel') { S.from = t.value; render(); }
   if (t.id === 'toSel') { S.to = t.value; render(); }
   if (t.id === 'kartuSel') { S.tab.kartu = t.value; render(); }
+  if (t.id === 'hargaTarget') { S.tab.hargaTarget = t.value; render(); }
   if (t.id === 'ledgerSel') { S.tab.ledger = t.value; render(); }
   if (t.id === 'rsInp' && t.files[0]) {
     try { const j = JSON.parse(await t.files[0].text()); if (!Array.isArray(j.records)) throw new Error('File bukan backup ERP RPA');

@@ -7,9 +7,9 @@
 //   POST   /api/import             -> impor banyak record (restore backup)
 //   GET    /api/audit/:id          -> riwayat perubahan satu record
 
-const KINDS = new Set(['unit', 'item', 'partner', 'vehicle', 'account', 'po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset', 'setting']);
-const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', adj: 'ADJ', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV' };
-const DATED = new Set(['po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset']);
+const KINDS = new Set(['unit', 'item', 'partner', 'vehicle', 'account', 'po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset', 'price', 'setting']);
+const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', adj: 'ADJ', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV', price: 'HRG' };
+const DATED = new Set(['po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset', 'price']);
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
