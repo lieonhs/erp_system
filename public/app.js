@@ -1342,7 +1342,7 @@ PAGES.aset = () => {
   let T = [0, 0, 0, 0];
   const rows = list.map(a => { const d = a.data; const x = assetAt(a, asOf); const sold = d.dispose_date && d.dispose_date <= asOf;
     if (!sold) { T[0] += num(d.cost); T[1] += x.monthly; T[2] += x.acc; T[3] += x.book; }
-    return `<tr class="click" data-edit="${a.id}"><td>${esc(d.code || '')}</td><td>${esc(d.name)}</td><td>${esc((ASSET_CAT.find(c => c[0] === d.category) || [, ''])[1])}</td><td>${a.date}</td>${td(rp(d.cost), 1)}${td(fmt(num(d.life_months), 0), 1)}${td(rp(x.monthly), 1)}${td(rp(x.acc), 1)}${td(rp(x.book), 1)}<td>${sold ? badge('Dilepas ' + d.dispose_date) : x.book <= num(d.residual) + 0.5 && num(d.life_months) ? badge('Habis disusutkan', 'b-warn') : badge('Aktif', 'b-ok')}</td></tr>`; });
+    return `<tr class="click" data-edit="${a.id}"><td>${esc(d.code || '')}</td><td>${esc(d.name)}${d.condition === 'bekas' ? ' ' + badge('bekas', 'b-warn') : ''}</td><td>${esc((ASSET_CAT.find(c => c[0] === d.category) || [, ''])[1])}</td><td>${a.date}</td>${td(rp(d.cost), 1)}${td(fmt(num(d.life_months), 0), 1)}${td(rp(x.monthly), 1)}${td(rp(x.acc), 1)}${td(rp(x.book), 1)}<td>${sold ? badge('Dilepas ' + d.dispose_date) : x.book <= num(d.residual) + 0.5 && num(d.life_months) ? badge('Habis disusutkan', 'b-warn') : badge('Aktif', 'b-ok')}</td></tr>`; });
   rows.push(`<tr class="tot"><td colspan="4">Total aset aktif</td>${td(rp(T[0]), 1)}<td></td>${td(rp(T[1]), 1)}${td(rp(T[2]), 1)}${td(rp(T[3]), 1)}<td></td></tr>`);
   return `<div class="bar"><button data-new="asset">+ Aset tetap</button><span class="muted">Posisi per ${asOf}</span><span class="sp"></span>${exportBtn('t-aset')}</div>` +
     table(['No. aset', 'Nama', 'Kategori', 'Tgl perolehan', ['Harga perolehan', 1], ['Umur (bln)', 1], ['Penyusutan/bln', 1], ['Akumulasi', 1], ['Nilai buku', 1], 'Status'], rows, { id: 't-aset' }) +
@@ -1353,6 +1353,8 @@ FORMS.asset = rec => openForm({
   fields: [
     { k: 'code', label: 'No. aset (otomatis)', req: true }, { k: 'name', label: 'Nama aset', req: true },
     { k: 'category', label: 'Kategori', type: 'select', options: ASSET_CAT.map(c => [c[0], c[1]]), blank: null, onChange: v => { const c = ASSET_CAT.find(x => x[0] === v); if (c) $('#frm').elements['f:life_months'].value = c[2]; } },
+    { k: 'condition', label: 'Kondisi saat dibeli', type: 'select', blank: null, options: [['baru', 'Baru'], ['bekas', 'Bekas']], hint: 'Bekas: isi umur manfaat sisa (biasanya ½ dari baru)',
+      onChange: v => { const el = $('#frm').elements['f:life_months']; const c = ASSET_CAT.find(x => x[0] === $('#frm').elements['f:category'].value); if (c && c[2]) el.value = v === 'bekas' ? Math.round(c[2] / 2) : c[2]; } },
     unitField(), { k: 'date', label: 'Tanggal perolehan', type: 'date', req: true },
     { k: 'cost', label: 'Harga perolehan (Rp)', type: 'number', req: true }, { k: 'residual', label: 'Nilai sisa (Rp)', type: 'number' },
     { k: 'life_months', label: 'Umur manfaat (bulan)', type: 'number' },
