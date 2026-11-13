@@ -35,11 +35,11 @@ const COA_DEFAULT = [
   ['1501', 'Aset Tetap (Mesin, Kendaraan, Bangunan)', 'asset'], ['1502', 'Akumulasi Penyusutan', 'asset'],
   ['2101', 'Hutang Usaha', 'liability'], ['2102', 'Hutang Gaji / Lain-lain', 'liability'], ['2201', 'Hutang Bank', 'liability'],
   ['3101', 'Modal Pemilik', 'equity'], ['3201', 'Prive', 'equity'], ['3301', 'Laba Ditahan', 'equity'],
-  ['4101', 'Penjualan', 'revenue'], ['4102', 'Pendapatan Lain-lain', 'revenue'],
-  ['5101', 'Harga Pokok Penjualan', 'expense'], ['5102', 'Selisih / Susut Persediaan', 'expense'],
+  ['4101', 'Penjualan', 'revenue'], ['4102', 'Pendapatan Lain-lain', 'revenue'], ['4103', 'Laba Pelepasan Aset Tetap', 'revenue'],
+  ['5101', 'Harga Pokok Penjualan', 'expense'], ['5102', 'Selisih / Susut Persediaan', 'expense'], ['5103', 'Kerugian Penurunan Nilai Persediaan', 'expense'],
   ['5201', 'Overhead Produksi (aktual)', 'expense'], ['5202', 'Overhead Produksi Dibebankan', 'expense'],
   ['6101', 'Gaji & Upah', 'expense'], ['6102', 'Listrik & Air', 'expense'], ['6103', 'BBM & Transportasi', 'expense'],
-  ['6104', 'Sewa', 'expense'], ['6105', 'Pemeliharaan & Perbaikan', 'expense'], ['6106', 'Beban Penyusutan', 'expense'],
+  ['6104', 'Sewa', 'expense'], ['6105', 'Pemeliharaan & Perbaikan', 'expense'], ['6106', 'Beban Penyusutan', 'expense'], ['6108', 'Rugi Pelepasan Aset Tetap', 'expense'],
   ['6107', 'Perizinan, Sertifikasi & Retribusi', 'expense'], ['6199', 'Beban Lain-lain', 'expense'],
 ];
 const TYPE_LABEL = { asset: 'Aset', liability: 'Kewajiban', equity: 'Ekuitas', revenue: 'Pendapatan', expense: 'Beban' };
@@ -109,8 +109,8 @@ const Store = {
     this.localPersist();
   },
 };
-const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV' };
-const DATED = new Set(['po', 'gr', 'prod', 'do', 'so', 'cash', 'jv']);
+const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', adj: 'ADJ', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV' };
+const DATED = new Set(['po', 'gr', 'prod', 'adj', 'do', 'so', 'cash', 'jv', 'asset']);
 function localNextNo(kind, date) {
   const ym = (date || localDate()).slice(2, 7).replace('-', '');
   const pre = `${PREFIX[kind]}-${ym}-`;
@@ -162,9 +162,30 @@ async function reload() {
   S.E = engine();
 }
 
+// ---------- Penyusutan aset tetap (garis lurus, mulai bulan setelah perolehan) ----------
+const monthEnd = (y, m) => localDate(new Date(y, m + 1, 0));
+function depSchedule(a) {
+  const d = a.data; const base = num(d.cost) - num(d.residual) - num(d.opening_accum); const life = num(d.life_months);
+  const rows = []; let total = 0;
+  if (life > 0 && base > 0 && a.date) {
+    const monthly = r2((num(d.cost) - num(d.residual)) / life);
+    const cap = (() => { const t = new Date(); return monthEnd(t.getFullYear(), t.getMonth()); })();
+    let [y, m] = a.date.split('-').map(Number); m = m - 1;
+    for (let i = 0; i < 1200 && total < base - 0.005; i++) {
+      m++; if (m > 11) { m = 0; y++; }
+      const me = monthEnd(y, m);
+      if (me > cap) break;
+      if (d.dispose_date && me >= monthEnd(+d.dispose_date.slice(0, 4), +d.dispose_date.slice(5, 7) - 1)) break;
+      const amt = r2(Math.min(monthly, base - total)); total = r2(total + amt); rows.push({ date: me, amt });
+    }
+    return { monthly, rows, total, base };
+  }
+  return { monthly: 0, rows, total: 0, base };
+}
+
 // ---------- ENGINE: stok, HPP, jurnal ----------
 function engine() {
-  const order = { gr: 0, prod: 1, do: 2, so: 3 };
+  const order = { gr: 0, prod: 1, do: 2, so: 3, adj: 4 };
   const ev = S.recs.filter(r => r.kind in order).sort((a, b) =>
     (a.date || '').localeCompare(b.date || '') || order[a.kind] - order[b.kind] || (a.created_at || '').localeCompare(b.created_at || ''));
   const stock = new Map(); // unit|item -> {qty, ekor, value}
@@ -222,6 +243,20 @@ function engine() {
       const mainKg = outs.filter(l => itemCat(l.item_id) === 'product').reduce((a, l) => a + num(l.kg), 0);
       cost[r.id] = { liveCost: r2(liveCost), supCost: r2(supCost), overhead, total, outVals, consumed, inKg, inEkor, outKg, mainKg,
         yieldAll: inKg ? outKg / inKg : NaN, yieldMain: inKg ? mainKg / inKg : NaN, costPerKgMain: mainKg ? outVals.filter(o => itemCat(o.item) === 'product').reduce((a, o) => a + o.value, 0) / mainKg : NaN };
+    } else if (r.kind === 'adj') {
+      const lines = [];
+      for (const l of d.lines || []) {
+        if (!l.item_id) continue; const s = st(u, l.item_id);
+        const hasAct = l.kg_actual !== null && l.kg_actual !== undefined && l.kg_actual !== '';
+        const diff = hasAct ? r2(num(l.kg_actual) - s.qty) : -num(l.kg_out);
+        if (diff < 0) { const v = out(r, u, l.item_id, -diff, 0); lines.push({ item: l.item_id, type: 'loss', qty: diff, value: v }); }
+        else if (diff > 0) { const avg = s.qty > 0 ? s.value / s.qty : 0; const v = r2(avg * diff); move(r, u, l.item_id, diff, 0, v); lines.push({ item: l.item_id, type: 'gain', qty: diff, value: v }); }
+        const hasEk = l.ekor_actual !== null && l.ekor_actual !== undefined && l.ekor_actual !== '';
+        if (hasEk && num(l.ekor_actual) !== s.ekor) move(r, u, l.item_id, 0, num(l.ekor_actual) - s.ekor, 0);
+        const wd = Math.min(num(l.writedown), Math.max(s.value, 0));
+        if (wd > 0) { move(r, u, l.item_id, 0, 0, -wd); lines.push({ item: l.item_id, type: 'wd', qty: 0, value: r2(wd) }); }
+      }
+      cost[r.id] = { lines, loss: r2(lines.filter(x => x.type === 'loss').reduce((a, x) => a + x.value, 0)), gain: r2(lines.filter(x => x.type === 'gain').reduce((a, x) => a + x.value, 0)), wd: r2(lines.filter(x => x.type === 'wd').reduce((a, x) => a + x.value, 0)) };
     } else if (r.kind === 'do') {
       let cogs = 0; const lines = [];
       for (const l of d.lines || []) { if (!l.item_id) continue; const v = out(r, u, l.item_id, num(l.kg), num(l.ekor)); cogs += v; lines.push({ item: l.item_id, cogs: v }); }
@@ -269,6 +304,24 @@ function engine() {
       if (c.discount) J(r, '4101', c.discount, 0, 'Potongan penjualan');
       if (c.viaDO) { J(r, '5101', c.cogs, 0, 'HPP dari DO'); J(r, '1304', 0, c.cogs, 'DO ditagih'); }
       else for (const l of c.lines) { J(r, '5101', l.cogs, 0, 'HPP ' + nm(l.item)); J(r, ia(l.item), 0, l.cogs, 'Keluar ' + nm(l.item)); }
+    } else if (r.kind === 'adj' && c) {
+      for (const l of c.lines) {
+        if (l.type === 'loss') { J(r, '5102', l.value, 0, 'Susut/selisih ' + nm(l.item)); J(r, ia(l.item), 0, l.value, 'Penyesuaian ' + nm(l.item)); }
+        if (l.type === 'gain') { J(r, ia(l.item), l.value, 0, 'Lebih hasil opname ' + nm(l.item)); J(r, '5102', 0, l.value, 'Selisih lebih ' + nm(l.item)); }
+        if (l.type === 'wd') { J(r, '5103', l.value, 0, 'Penurunan nilai ' + nm(l.item)); J(r, ia(l.item), 0, l.value, 'Penurunan nilai ' + nm(l.item)); }
+      }
+    } else if (r.kind === 'asset') {
+      const sch = depSchedule(r); cost[r.id] = sch;
+      const cst = num(d.cost), open = num(d.opening_accum), fund = d.funding || '1102';
+      if (fund !== 'none') { J(r, '1501', cst, 0, 'Perolehan ' + d.name); if (open) J(r, '1502', 0, open, 'Akumulasi awal ' + d.name); J(r, fund, 0, cst - open, 'Perolehan ' + d.name); }
+      for (const x of sch.rows) { const pd = { id: r.id, kind: 'dep', no: `DEP-${d.code || ''}-${x.date.slice(2, 7).replace('-', '')}`, date: x.date, unit_id: r.unit_id, data: {} };
+        J(pd, '6106', x.amt, 0, 'Penyusutan ' + d.name); J(pd, '1502', 0, x.amt, 'Penyusutan ' + d.name); }
+      if (d.dispose_date) {
+        const pd = { id: r.id, kind: 'dispose', no: `DSP-${d.code || ''}`, date: d.dispose_date, unit_id: r.unit_id, data: {} };
+        const acc = open + sch.total, book = cst - acc, sale = num(d.sale_price), gl2 = sale - book;
+        J(pd, d.sale_account || '1101', sale, 0, 'Penjualan aset ' + d.name); J(pd, '1502', acc, 0, 'Hapus akumulasi ' + d.name); J(pd, '1501', 0, cst, 'Hapus aset ' + d.name);
+        if (gl2 > 0) J(pd, '4103', 0, gl2, 'Laba pelepasan ' + d.name); else if (gl2 < 0) J(pd, '6108', -gl2, 0, 'Rugi pelepasan ' + d.name);
+      }
     } else if (r.kind === 'cash') {
       const a = num(d.amount), cashAcc = d.account || '1101', memo = d.note || CASH_CAT[d.category];
       switch (d.category) {
@@ -393,9 +446,9 @@ function readForm() {
   for (const t of FORM.tables || []) {
     data[t.k] = $$(`[data-line="${t.k}"]`, frm).map(tr => {
       const o = {};
-      for (const c of t.cols) { if (c.calc) continue; const el = tr.querySelector(`[name="l:${c.k}"]`); o[c.k] = c.type === 'number' ? num(el.value) : el.value; }
+      for (const c of t.cols) { if (c.calc) continue; const el = tr.querySelector(`[name="l:${c.k}"]`); o[c.k] = c.type === 'number' ? (c.nullable && el.value.trim() === '' ? null : num(el.value)) : el.value; }
       return o;
-    }).filter(o => Object.entries(o).some(([k, v]) => v !== '' && v !== 0));
+    }).filter(o => Object.entries(o).some(([k, v]) => v !== '' && v !== 0 && v !== null));
   }
   return data;
 }
@@ -442,11 +495,11 @@ const unitField = () => ({ k: 'unit_id', label: 'Unit usaha', type: 'select', op
 
 // ---------- Halaman ----------
 const NAV = [
-  ['Ringkasan', [['dashboard', 'Dashboard']]],
+  ['Ringkasan', [['dashboard', 'Dashboard'], ['analisis', 'Analisis Kinerja & Modal']]],
   ['Purchasing', [['po', 'Purchase Order'], ['gr', 'Penerimaan Barang'], ['supplier', 'Kinerja Supplier']]],
-  ['Logistik', [['prod', 'Pemotongan / Produksi'], ['stok', 'Stok Persediaan'], ['kartu', 'Kartu Stok'], ['kirim', 'Pengiriman'], ['armada', 'Armada & Driver']]],
+  ['Logistik', [['prod', 'Pemotongan / Produksi'], ['stok', 'Stok Persediaan'], ['kartu', 'Kartu Stok'], ['adj', 'Stok Opname & Penyesuaian'], ['kirim', 'Pengiriman'], ['armada', 'Armada & Driver']]],
   ['Penjualan', [['do', 'Delivery Order / Surat Jalan'], ['so', 'Invoice Penjualan']]],
-  ['Finance', [['kas', 'Kas & Bank'], ['hutang', 'Hutang Supplier'], ['piutang', 'Piutang Customer'], ['jv', 'Jurnal Umum'], ['ledger', 'Buku Besar'], ['lapkeu', 'Laporan Keuangan']]],
+  ['Finance', [['kas', 'Kas & Bank'], ['hutang', 'Hutang Supplier'], ['piutang', 'Piutang Customer'], ['aset', 'Aset Tetap & Penyusutan'], ['jv', 'Jurnal Umum'], ['ledger', 'Buku Besar'], ['lapkeu', 'Laporan Keuangan']]],
   ['Master', [['barang', 'Barang & Produk'], ['vendor', 'Vendor / Supplier'], ['customer', 'Customer'], ['unit', 'Unit Usaha'], ['akun', 'Bagan Akun'], ['setting', 'Pengaturan & Backup']]],
 ];
 const PAGES = {};
@@ -682,7 +735,7 @@ PAGES.kartu = () => {
   const mv = S.E.moves.filter(m => m.unit === u && m.item === i);
   return `<div class="bar">${sel}<span class="sp"></span>${exportBtn('t-kartu')}</div>` +
     table(['Tanggal', 'Dokumen', 'Keterangan', ['Masuk', 1], ['Keluar', 1], ['Saldo qty', 1], ['Saldo ekor', 1], ['Nilai mutasi', 1], ['Saldo nilai', 1]], mv.map(m =>
-      `<tr><td>${m.date}</td><td>${esc(m.doc.no)}</td><td>${esc({ gr: 'Penerimaan ' + nm(m.doc.data.partner_id), prod: 'Pemotongan', do: 'Kirim (DO) ke ' + nm(m.doc.data.partner_id), so: 'Jual langsung ke ' + nm(m.doc.data.partner_id) }[m.doc.kind])}</td>${td(m.qty > 0 ? fmt(m.qty) : '', 1)}${td(m.qty < 0 ? fmt(-m.qty) : '', 1)}${td(fmt(m.balQty), 1)}${td(fmt(m.balEkor, 0), 1)}${td(rp(m.value), 1)}${td(rp(m.balValue), 1)}</tr>`), { id: 't-kartu' });
+      `<tr><td>${m.date}</td><td>${esc(m.doc.no)}</td><td>${esc({ gr: 'Penerimaan ' + nm(m.doc.data.partner_id), prod: 'Pemotongan', adj: 'Penyesuaian / opname', do: 'Kirim (DO) ke ' + nm(m.doc.data.partner_id), so: 'Jual langsung ke ' + nm(m.doc.data.partner_id) }[m.doc.kind])}</td>${td(m.qty > 0 ? fmt(m.qty) : '', 1)}${td(m.qty < 0 ? fmt(-m.qty) : '', 1)}${td(fmt(m.balQty), 1)}${td(fmt(m.balEkor, 0), 1)}${td(rp(m.value), 1)}${td(rp(m.balValue), 1)}</tr>`), { id: 't-kartu' });
 };
 
 // ---- Delivery Order ----
@@ -1102,6 +1155,147 @@ FORMS.partner = (rec, preset) => {
 };
 FORMS.vendor = () => FORMS.partner(null, 'supplier');
 FORMS.customer = () => FORMS.partner(null, 'customer');
+
+// ---- Analisis kinerja, modal & termin ----
+const SEG_TERM = { pasar: [0, 3], resto: [7, 14], retail: [30, 45], distributor: [7, 14], lain: [0, 7] };
+PAGES.analisis = () => {
+  const from = S.from || (S.recs.filter(r => r.date).map(r => r.date).sort()[0] || localDate()), to = S.to || localDate();
+  const days = Math.max(1, daysBetween(from, to) + 1), ann = 365 / days, perMonth = 30 / days;
+  const P = plData(from, to); const NI = P.R - P.C - P.X + P.O;
+  const pos = date => { const b = balances(date); const sum = f => Object.entries(b).filter(([a]) => f(a)).reduce((x, [a, v]) => x + natural(a, v), 0);
+    const pl = Object.entries(b).reduce((x, [a, v]) => { const t = accType(a); return x + (t === 'revenue' ? v.c - v.d : t === 'expense' ? -(v.d - v.c) : 0); }, 0);
+    const A = sum(a => accType(a) === 'asset'), L = sum(a => accType(a) === 'liability'), Q = sum(a => accType(a) === 'equity') + pl;
+    return { A, L, Q, CA: sum(a => /^1[1-4]/.test(a)), CL: sum(a => /^21/.test(a)), FA: sum(a => /^15/.test(a)), AR: sum(a => a === '1201'), AP: sum(a => a === '2101'),
+      INV: sum(a => /^130/.test(a)), CASH: sum(a => accounts().some(x => x.cash && x.code === a)) };
+  };
+  const E1 = pos(to), E0 = pos(addDays(from, -1));
+  const avgA = (E0.A + E1.A) / 2 || E1.A, avgQ = (E0.Q + E1.Q) / 2 || E1.Q;
+  const dep = glF(l => l.acc === '6106' && l.date >= from && l.date <= to).reduce((a, l) => a + l.debit - l.credit, 0);
+  const purch = glF(l => l.doc.kind === 'gr' && l.acc === '2101' && l.date >= from && l.date <= to).reduce((a, l) => a + l.credit, 0);
+  const soKg = K('so').filter(r => inUnit(r) && r.date >= from && r.date <= to).reduce((a, r) => a + (r.data.lines || []).filter(l => (byId(l.item_id) || { data: {} }).data.category === 'product').reduce((x, l) => x + num(l.kg), 0), 0);
+  const DSO = P.R ? E1.AR / (P.R / days) : NaN, DIO = P.C ? E1.INV / (P.C / days) : NaN, DPO = purch ? E1.AP / (purch / days) : NaN, CCC = DIO + DSO - DPO;
+  const wcNeed = isFinite(CCC) ? Math.max(0, CCC) * (P.C / days) : NaN;
+  const cashProfitM = (NI + dep) * perMonth;
+  const invest = E1.FA + Math.max(0, E1.CA - E1.CL);
+  const payback = cashProfitM > 0 ? invest / cashProfitM : NaN;
+  const cmr = P.R ? (P.R - P.C) / P.R : NaN, fixedM = P.X * perMonth;
+  const bepRev = cmr > 0 ? fixedM / cmr : NaN, revPerKg = soKg ? P.R / soKg : NaN;
+  const k = (l, v, sub, bad) => `<div class="kpi"><small>${l}</small><b class="${bad ? 'neg' : ''}">${v}</b>${sub ? `<em>${sub}</em>` : ''}</div>`;
+  const pctA = (v) => isFinite(v) ? pct(v) : '-';
+  // termin
+  const supW = {}; let supT = 0;
+  for (const g of K('gr').filter(r => inUnit(r) && r.date >= from && r.date <= to)) { const v = (S.E.cost[g.id] || {}).total || 0; supT += v; supW[g.data.partner_id] = (supW[g.data.partner_id] || 0) + v; }
+  const avgSupTerm = supT ? Object.entries(supW).reduce((a, [pid, v]) => a + num((byId(pid) || { data: {} }).data.terms) * v, 0) / supT : NaN;
+  const basisTerm = isFinite(DPO) ? DPO : avgSupTerm;
+  const recCust = isFinite(basisTerm) ? Math.max(0, Math.floor(basisTerm - (isFinite(DIO) ? DIO : 0))) : NaN;
+  const custRows = partners('customer').map(p => { const d = p.data; const bal = partnerBalance(p.id, '1201'); const od = aging(p.id, 'so', '1201').filter(o => bucket(o.due) > 0).reduce((a, o) => a + o.rest, 0);
+    const seg = SEG_TERM[d.category] || null; const t = num(d.terms);
+    const flag = od > 0 ? badge('Ada tunggakan', 'b-bad') : isFinite(recCust) && t > recCust ? badge('Termin > batas aman', 'b-warn') : badge('OK', 'b-ok');
+    return `<tr><td>${esc(d.code || '')} ${esc(d.name)}</td><td>${esc((CUST_CAT.find(c => c[0] === d.category) || [, '-'])[1])}</td>${td(t + ' hr', 1)}<td>${seg ? seg[0] + '–' + seg[1] + ' hr' : '-'}</td>${td(rp(bal), 1)}${td(od ? rp(od) : '', 1)}${td(d.credit_limit ? rp(d.credit_limit) : '-', 1)}<td>${flag}</td></tr>`; });
+  const supRows = partners('supplier').filter(p => supW[p.id]).map(p => `<tr><td>${esc(p.data.code || '')} ${esc(p.data.name)}</td>${td(num(p.data.terms) + ' hr', 1)}${td(rp(supW[p.id]), 1)}${td(pct(supW[p.id] / supT), 1)}${td(rp(partnerBalance(p.id, '2101')), 1)}</tr>`);
+  return `<p class="muted">Periode ${from} s/d ${to} (${days} hari) · ${S.unit === 'all' ? 'Semua unit' : esc(nm(S.unit))}. Rasio tahunan = rasio periode × 365/${days}. Periode pendek (&lt; 3 bulan) membuat angka tahunan sangat fluktuatif.</p>
+  <h3>Profitabilitas</h3><div class="kpis">
+    ${k('Pendapatan', rp(P.R), rp(P.R * perMonth) + '/bulan')}${k('Laba kotor', rp(P.R - P.C), 'margin ' + pctA(P.R ? (P.R - P.C) / P.R : NaN), P.R - P.C < 0)}
+    ${k('Beban operasional', rp(P.X), pctA(P.R ? P.X / P.R : NaN) + ' dari pendapatan')}${k('Laba bersih', rp(NI), 'margin ' + pctA(P.R ? NI / P.R : NaN), NI < 0)}
+    ${k('Harga jual rata2 produk utama', isFinite(revPerKg) ? rp(revPerKg) + '/kg' : '-', fmt(soKg) + ' kg terjual')}${k('EBITDA', rp(NI + dep), 'laba bersih + penyusutan ' + rp(dep))}
+  </div>
+  <h3>Imbal hasil (return)</h3><div class="kpis">
+    ${k('ROA (tahunan)', pctA(avgA ? NI / avgA * ann : NaN), 'periode ' + pctA(avgA ? NI / avgA : NaN) + ' · rata2 aset ' + rp(avgA), NI < 0)}
+    ${k('ROE (tahunan)', pctA(avgQ > 0 ? NI / avgQ * ann : NaN), 'periode ' + pctA(avgQ > 0 ? NI / avgQ : NaN) + ' · rata2 ekuitas ' + rp(avgQ), NI < 0)}
+    ${k('Perputaran aset (tahunan)', isFinite(P.R / avgA) ? fmt(P.R / avgA * ann, 2) + '×' : '-', 'pendapatan ÷ aset')}
+    ${k('Utang ÷ ekuitas', E1.Q > 0 ? fmt(E1.L / E1.Q, 2) + '×' : '-', 'kewajiban ' + rp(E1.L))}
+  </div>
+  <h3>Modal & investasi</h3><div class="kpis">
+    ${k('Aset tetap (nilai buku)', rp(E1.FA))}${k('Modal kerja bersih', rp(E1.CA - E1.CL), 'aset lancar ' + rp(E1.CA) + ' − utang lancar ' + rp(E1.CL), E1.CA - E1.CL < 0)}
+    ${k('Total modal tertanam', rp(invest), 'aset tetap + modal kerja')}
+    ${k('Arus kas operasi est./bulan', rp(cashProfitM), 'laba bersih + penyusutan', cashProfitM < 0)}
+    ${k('Payback period', isFinite(payback) ? fmt(payback, 1) + ' bulan' : 'tidak tercapai', isFinite(payback) ? '≈ ' + fmt(payback / 12, 1) + ' tahun' : 'arus kas negatif', !isFinite(payback))}
+    ${k('Titik impas (BEP) / bulan', isFinite(bepRev) ? rp(bepRev) : '-', isFinite(bepRev) && isFinite(revPerKg) ? '≈ ' + fmt(bepRev / revPerKg, 0) + ' kg produk utama/bulan' : 'butuh data penjualan')}
+  </div>
+  <h3>Siklus kas & termin pembayaran</h3><div class="kpis">
+    ${k('Lama stok (DIO)', isFinite(DIO) ? fmt(DIO, 1) + ' hari' : '-', 'persediaan ÷ HPP harian')}
+    ${k('Lama tagih piutang (DSO)', isFinite(DSO) ? fmt(DSO, 1) + ' hari' : '-', 'piutang ÷ penjualan harian')}
+    ${k('Lama bayar supplier (DPO)', isFinite(DPO) ? fmt(DPO, 1) + ' hari' : '-', 'termin master rata2 ' + (isFinite(avgSupTerm) ? fmt(avgSupTerm, 1) + ' hr' : '-'))}
+    ${k('Siklus konversi kas (CCC)', isFinite(CCC) ? fmt(CCC, 1) + ' hari' : '-', 'DIO + DSO − DPO', CCC > 0)}
+    ${k('Modal kerja yang terikat', isFinite(wcNeed) ? rp(wcNeed) : '-', 'CCC × HPP harian')}
+    ${k('Batas aman termin customer', isFinite(recCust) ? recCust + ' hari' : '-', 'DPO − DIO: customer harus bayar sebelum supplier ditagih')}
+  </div>
+  <div class="card"><h3>Arti angka & rekomendasi termin</h3><ul style="margin:0;padding-left:18px;line-height:1.7">
+    ${isFinite(CCC) ? (CCC > 0 ? `<li>Uang kamu "nyangkut" <b>${fmt(CCC, 1)} hari</b> antara bayar ayam ke peternak dan terima uang dari customer. Itu butuh modal kerja sekitar <b>${rp(wcNeed)}</b>. Setiap 1 hari termin customer dipercepat membebaskan ±<b>${rp(P.R / days)}</b>.</li>` : `<li>CCC ${fmt(CCC, 1)} hari (≤ 0): customer membayar sebelum supplier ditagih — posisi kas sehat, operasional dibiayai supplier.</li>`) : '<li>Belum cukup data (butuh penjualan, pembelian, dan HPP di periode ini).</li>'}
+    <li><b>Aturan dasar:</b> termin customer ≤ termin supplier − lama stok. Ayam segar/karkas hanya bertahan 1–2 hari, jadi DIO idealnya ≤ 2 hari; kalau lebih, cek stok yang menumpuk.</li>
+    <li><b>Patokan umum (perlu kamu cocokkan dengan kondisi lapangan):</b> peternak/broker ayam hidup biasanya minta tunai s/d 7 hari; pedagang pasar tunai–3 hari; rumah makan/katering & agen 7–14 hari; supermarket/retail modern 30–45 hari. Customer bertermin panjang sebaiknya diberi harga lebih tinggi (biaya modal) dan limit kredit.</li>
+    <li>Pasang <b>limit kredit</b> di master customer — invoice yang membuat piutang melebihi limit akan ditandai merah.</li>
+  </ul></div>
+  <div class="grid2"><div><h3>Customer vs batas termin</h3>${table(['Customer', 'Segmen', ['Termin', 1], 'Patokan segmen', ['Saldo', 1], ['Tunggakan', 1], ['Limit', 1], 'Status'], custRows)}</div>
+  <div><h3>Supplier (porsi pembelian periode ini)</h3>${table(['Supplier', ['Termin', 1], ['Pembelian', 1], ['Porsi', 1], ['Saldo hutang', 1]], supRows)}</div></div>
+  <p class="note">Asumsi: HPP dianggap biaya variabel dan seluruh beban operasional (termasuk penyusutan) dianggap biaya tetap untuk BEP. ROE memakai ekuitas termasuk laba berjalan. Payback = (aset tetap + modal kerja) ÷ arus kas operasi bulanan; bukan pengganti NPV/IRR untuk keputusan investasi besar.</p>`;
+};
+
+// ---- Stok opname & penyesuaian ----
+const ADJ_REASON = [['opname', 'Stok opname (hitung fisik)'], ['susut', 'Susut berat / penguapan di cold storage'], ['rusak', 'Rusak / busuk / afkir'], ['expired', 'Kedaluwarsa'], ['nrv', 'Penurunan nilai (harga pasar turun)']];
+PAGES.adj = () => `<div class="bar"><button data-new="adj">+ Penyesuaian / opname</button><span class="sp"></span>${exportBtn('t-adj')}</div>` +
+  table(['No', 'Tanggal', 'Unit', 'Alasan', ['Barang', 1], ['Rugi susut/selisih', 1], ['Selisih lebih', 1], ['Penurunan nilai', 1], 'Keterangan'], docs('adj').map(r => {
+    const c = S.E.cost[r.id] || {};
+    return `<tr class="click" data-edit="${r.id}"><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.unit_id))}</td><td>${esc(Object.fromEntries(ADJ_REASON)[r.data.reason] || '')}</td>${td((r.data.lines || []).length, 1)}${td(c.loss ? rp(c.loss) : '', 1)}${td(c.gain ? rp(c.gain) : '', 1)}${td(c.wd ? rp(c.wd) : '', 1)}<td>${esc(r.data.note || '')}</td></tr>`;
+  }), { id: 't-adj' }) +
+  `<p class="note"><b>Cara isi:</b> isi <i>Qty fisik</i> bila menghitung ulang stok (selisih dihitung otomatis terhadap stok sistem pada tanggal itu), <i>atau</i> isi <i>Qty dibuang</i> untuk barang rusak/busuk. <i>Penurunan nilai</i> dipakai bila barang masih ada tapi nilainya turun (mis. karkas jadi produk afkir). Rugi masuk akun 5102/5103 dengan nilai rata-rata persediaan.</p>`;
+FORMS.adj = rec => openForm({
+  kind: 'adj', title: 'Stok Opname & Penyesuaian', rec, defaults: { date: localDate(), unit_id: defaultUnit(), reason: 'opname' },
+  fields: [{ k: 'date', label: 'Tanggal', type: 'date', req: true }, unitField(),
+    { k: 'reason', label: 'Alasan', type: 'select', options: ADJ_REASON, blank: null }, { k: 'checker', label: 'Dihitung / disetujui oleh' },
+    { k: 'note', label: 'Keterangan', type: 'textarea', wide: true }],
+  tables: [{ k: 'lines', label: 'Barang', cols: [
+    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(), w: '30%' },
+    { k: 'sys', label: 'Stok sistem (saat ini)', calc: (r, h) => { const s = S.E.stock.get((h.unit_id || defaultUnit()) + '|' + r.item_id); return s ? `${fmt(s.qty)}${s.ekor ? ' / ' + fmt(s.ekor, 0) + ' ekor' : ''} · ${s.qty > 0 ? rp(s.value / s.qty) + '/sat' : ''}` : '-'; } },
+    { k: 'kg_actual', label: 'Qty fisik', type: 'number', nullable: true }, { k: 'ekor_actual', label: 'Ekor fisik', type: 'number', nullable: true },
+    { k: 'kg_out', label: 'Qty dibuang/rusak', type: 'number' }, { k: 'writedown', label: 'Penurunan nilai (Rp)', type: 'number' }, { k: 'note', label: 'Ket.' }] }],
+  calc: d => {
+    let est = 0; const u = d.unit_id || defaultUnit();
+    for (const l of d.lines || []) { const s = S.E.stock.get(u + '|' + l.item_id); if (!s) continue; const avg = s.qty > 0 ? s.value / s.qty : 0;
+      const diff = l.kg_actual !== null && l.kg_actual !== undefined ? l.kg_actual - s.qty : -num(l.kg_out); est += diff * avg - num(l.writedown); }
+    return `Perkiraan dampak ke laba: <b class="${est < 0 ? 'neg' : 'pos'}">${rp(est)}</b> <span class="muted">(dihitung dari stok & harga rata-rata saat ini; angka final memakai posisi stok pada tanggal penyesuaian)</span>`;
+  },
+  validate: d => { if (!(d.lines || []).length) return 'Isi minimal satu barang'; if (d.lines.some(l => !l.item_id)) return 'Setiap baris wajib barang';
+    if (d.lines.some(l => (l.kg_actual === null || l.kg_actual === undefined) && !l.kg_out && !l.writedown && (l.ekor_actual === null || l.ekor_actual === undefined))) return 'Isi qty fisik, qty dibuang, atau penurunan nilai di setiap baris'; },
+});
+
+// ---- Aset tetap & penyusutan ----
+const ASSET_CAT = [['bangunan', 'Bangunan (20 th)', 240], ['mesin', 'Mesin & peralatan potong (8 th)', 96], ['kendaraan', 'Kendaraan (8 th)', 96], ['pendingin', 'Cold storage / freezer (8 th)', 96], ['peralatan', 'Peralatan kecil, timbangan, IT (4 th)', 48], ['tanah', 'Tanah (tidak disusutkan)', 0]];
+function assetAt(a, asOf) { const c = S.E.cost[a.id] || { rows: [], monthly: 0 }; const acc = num(a.data.opening_accum) + c.rows.filter(x => x.date <= asOf).reduce((s, x) => s + x.amt, 0); return { acc, book: num(a.data.cost) - acc, monthly: c.monthly }; }
+PAGES.aset = () => {
+  const asOf = S.to || localDate(); const list = K('asset').filter(inUnit).sort((a, b) => (a.data.code || '').localeCompare(b.data.code || ''));
+  let T = [0, 0, 0, 0];
+  const rows = list.map(a => { const d = a.data; const x = assetAt(a, asOf); const sold = d.dispose_date && d.dispose_date <= asOf;
+    if (!sold) { T[0] += num(d.cost); T[1] += x.monthly; T[2] += x.acc; T[3] += x.book; }
+    return `<tr class="click" data-edit="${a.id}"><td>${esc(d.code || '')}</td><td>${esc(d.name)}</td><td>${esc((ASSET_CAT.find(c => c[0] === d.category) || [, ''])[1])}</td><td>${a.date}</td>${td(rp(d.cost), 1)}${td(fmt(num(d.life_months), 0), 1)}${td(rp(x.monthly), 1)}${td(rp(x.acc), 1)}${td(rp(x.book), 1)}<td>${sold ? badge('Dilepas ' + d.dispose_date) : x.book <= num(d.residual) + 0.5 && num(d.life_months) ? badge('Habis disusutkan', 'b-warn') : badge('Aktif', 'b-ok')}</td></tr>`; });
+  rows.push(`<tr class="tot"><td colspan="4">Total aset aktif</td>${td(rp(T[0]), 1)}<td></td>${td(rp(T[1]), 1)}${td(rp(T[2]), 1)}${td(rp(T[3]), 1)}<td></td></tr>`);
+  return `<div class="bar"><button data-new="asset">+ Aset tetap</button><span class="muted">Posisi per ${asOf}</span><span class="sp"></span>${exportBtn('t-aset')}</div>` +
+    table(['No. aset', 'Nama', 'Kategori', 'Tgl perolehan', ['Harga perolehan', 1], ['Umur (bln)', 1], ['Penyusutan/bln', 1], ['Akumulasi', 1], ['Nilai buku', 1], 'Status'], rows, { id: 't-aset' }) +
+    `<p class="note">Metode garis lurus: (harga perolehan − nilai sisa) ÷ umur. Penyusutan dijurnal otomatis setiap akhir bulan mulai bulan setelah perolehan (Dr 6106 Beban Penyusutan / Cr 1502 Akumulasi). Umur default mengikuti kelompok fiskal; untuk laporan komersial boleh diubah sesuai taksiran manfaat.</p>`;
+};
+FORMS.asset = rec => openForm({
+  kind: 'asset', title: 'Aset Tetap', rec, defaults: { date: localDate(), unit_id: defaultUnit(), code: nextCode('asset', 'AT'), category: 'mesin', life_months: 96, residual: 0, funding: '1102' },
+  fields: [
+    { k: 'code', label: 'No. aset (otomatis)', req: true }, { k: 'name', label: 'Nama aset', req: true },
+    { k: 'category', label: 'Kategori', type: 'select', options: ASSET_CAT.map(c => [c[0], c[1]]), blank: null, onChange: v => { const c = ASSET_CAT.find(x => x[0] === v); if (c) $('#frm').elements['f:life_months'].value = c[2]; } },
+    unitField(), { k: 'date', label: 'Tanggal perolehan', type: 'date', req: true },
+    { k: 'cost', label: 'Harga perolehan (Rp)', type: 'number', req: true }, { k: 'residual', label: 'Nilai sisa (Rp)', type: 'number' },
+    { k: 'life_months', label: 'Umur manfaat (bulan)', type: 'number' },
+    { k: 'funding', label: 'Dibayar dari', type: 'select', blank: null, options: () => [...accounts().filter(a => a.cash).map(a => [a.code, a.code + ' · ' + a.name]), ['2102', '2102 · Hutang lain-lain (kredit)'], ['2201', '2201 · Hutang bank'], ['3101', '3101 · Modal pemilik / saldo awal'], ['none', 'Sudah dicatat lewat Kas/Jurnal (jangan jurnal lagi)']],
+      hint: 'Jangan catat lagi di Kas, supaya tidak dobel' },
+    { k: 'opening_accum', label: 'Akumulasi penyusutan awal (aset lama)', type: 'number', hint: 'Isi bila aset sudah dipakai sebelum memakai aplikasi ini' },
+    { k: 'location', label: 'Lokasi / penanggung jawab' }, { k: 'serial', label: 'No. seri / plat / sertifikat' },
+    { k: 'dispose_date', label: 'Tanggal dijual / dilepas', type: 'date' }, { k: 'sale_price', label: 'Harga jual saat dilepas (Rp)', type: 'number' },
+    { k: 'sale_account', label: 'Hasil jual masuk ke', type: 'select', options: cashAccOpts, blank: null },
+    { k: 'note', label: 'Catatan', type: 'textarea', wide: true },
+  ],
+  calc: d => { const m = num(d.life_months) ? (num(d.cost) - num(d.residual)) / num(d.life_months) : 0;
+    return m ? `Penyusutan <b>${rp(m)}/bulan</b> · ${rp(m * 12)}/tahun · sisa yang akan disusutkan ${rp(num(d.cost) - num(d.residual) - num(d.opening_accum))}` : 'Tidak disusutkan'; },
+  validate: d => { if (!(d.cost > 0)) return 'Harga perolehan wajib > 0'; if (d.residual >= d.cost) return 'Nilai sisa harus lebih kecil dari harga perolehan';
+    if (num(d.opening_accum) > d.cost - num(d.residual)) return 'Akumulasi awal melebihi nilai yang dapat disusutkan';
+    if (d.dispose_date && d.dispose_date < d.date) return 'Tanggal pelepasan sebelum tanggal perolehan';
+    if (K('asset').some(a => a.data.code === d.code && (!rec || a.id !== rec.id))) return `No. aset ${d.code} sudah dipakai`; },
+});
 
 PAGES.unit = () => `<div class="bar"><button data-new="unit">+ Unit usaha</button><span class="muted">Tambah unit untuk ekspansi (mis. distribusi daging, pakan, peternakan, frozen food). Semua modul otomatis bisa dipakai per unit.</span></div>` +
   table(['Kode', 'Nama', 'Keterangan', ['Transaksi', 1]], units().map(u => `<tr class="click" data-edit="${u.id}"><td>${esc(u.data.code || '')}</td><td>${esc(u.data.name)}</td><td>${esc(u.data.desc || '')}</td>${td(S.recs.filter(r => r.unit_id === u.id && DATED.has(r.kind)).length, 1)}</tr>`));

@@ -7,10 +7,11 @@ Hosting: **Cloudflare Workers** (frontend + API) + **Cloudflare D1** (database S
 | Area | Isi |
 |---|---|
 | Purchasing | Purchase Order, Penerimaan Barang (timbang kandang vs timbang RPA, ekor mati/DOA, susut), Kinerja Supplier (biaya efektif/kg) |
-| Logistik | Pemotongan/Produksi (rendemen karkas, alokasi biaya ke produk), Stok, Kartu Stok, Pengiriman (status DO), Armada & Driver |
+| Logistik | Stok Opname & Penyesuaian (susut, rusak, penurunan nilai), Pemotongan/Produksi (rendemen karkas, alokasi biaya ke produk), Stok, Kartu Stok, Pengiriman (status DO), Armada & Driver |
 | Penjualan | **Delivery Order / Surat Jalan** (barang keluar) → **Invoice** (tagihan dari satu/lebih DO, atau penjualan langsung), limit kredit, status bayar |
 | Dokumen cetak | Surat Jalan (2 lembar), Bukti Penerimaan Barang (2 lembar, opsi dengan harga), Invoice — kop diatur di Pengaturan |
-| Finance | Kas & Bank, Hutang & Piutang (umur/aging FIFO), Jurnal Umum, Buku Besar, Laba Rugi, Neraca, Neraca Saldo, Laba per Unit |
+| Analisis | Profitabilitas (margin, EBITDA), ROA/ROE tahunan, modal tertanam, payback, BEP, siklus kas (DIO/DSO/DPO/CCC), batas aman termin customer |
+| Finance | Aset Tetap & Penyusutan otomatis (garis lurus, jurnal tiap akhir bulan, pelepasan aset), Kas & Bank, Hutang & Piutang (umur/aging FIFO), Jurnal Umum, Buku Besar, Laba Rugi, Neraca, Neraca Saldo, Laba per Unit |
 | Master | Barang (No. barang otomatis BRG-0001), Vendor (V-0001, rekening bank), Customer (C-0001, limit kredit, alamat kirim), Unit Usaha, Bagan Akun, Tutup buku, Backup/restore |
 
 Semua jurnal dibuat otomatis dari transaksi. Edit transaksi → stok, HPP, jurnal, dan laporan ikut terhitung ulang.
