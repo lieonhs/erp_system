@@ -7,10 +7,11 @@ Hosting: **Cloudflare Workers** (frontend + API) + **Cloudflare D1** (database S
 | Area | Isi |
 |---|---|
 | Purchasing | Purchase Order, Penerimaan Barang (timbang kandang vs timbang RPA, ekor mati/DOA, susut), Kinerja Supplier (biaya efektif/kg) |
-| Logistik | Pemotongan/Produksi (rendemen karkas, alokasi biaya ke produk), Stok, Kartu Stok, Pengiriman (status + surat jalan), Armada & Driver |
-| Penjualan | Invoice, HPP & laba kotor per transaksi, cetak invoice |
+| Logistik | Pemotongan/Produksi (rendemen karkas, alokasi biaya ke produk), Stok, Kartu Stok, Pengiriman (status DO), Armada & Driver |
+| Penjualan | **Delivery Order / Surat Jalan** (barang keluar) → **Invoice** (tagihan dari satu/lebih DO, atau penjualan langsung), limit kredit, status bayar |
+| Dokumen cetak | Surat Jalan (2 lembar), Bukti Penerimaan Barang (2 lembar, opsi dengan harga), Invoice — kop diatur di Pengaturan |
 | Finance | Kas & Bank, Hutang & Piutang (umur/aging FIFO), Jurnal Umum, Buku Besar, Laba Rugi, Neraca, Neraca Saldo, Laba per Unit |
-| Master | Barang, Supplier/Customer, Unit Usaha, Bagan Akun, Tutup buku, Backup/restore |
+| Master | Barang (No. barang otomatis BRG-0001), Vendor (V-0001, rekening bank), Customer (C-0001, limit kredit, alamat kirim), Unit Usaha, Bagan Akun, Tutup buku, Backup/restore |
 
 Semua jurnal dibuat otomatis dari transaksi. Edit transaksi → stok, HPP, jurnal, dan laporan ikut terhitung ulang.
 
@@ -60,6 +61,7 @@ Tambah **Unit Usaha** (mis. distribusi frozen food, pakan, peternakan). Barang, 
 ## Batasan yang perlu diketahui
 - **Metode biaya**: rata-rata bergerak (moving average). Biaya produksi bersama dialokasikan berdasarkan nilai jual acuan (kg × harga). Bila harga acuan tidak diperbarui, HPP per produk akan bias.
 - **Susut & ayam mati** dibebankan ke biaya persediaan (bukan beban terpisah). Bila ingin dilaporkan terpisah, buat jurnal koreksi ke akun 5102.
+- **DO vs invoice**: DO mengurangi stok dan memindahkan nilainya ke akun 1304 (Barang Terkirim Belum Ditagih). HPP baru diakui saat invoice dibuat. Saldo 1304 di akhir bulan = DO yang belum ditagih — cek menu DO sebelum tutup buku.
 - **Pajak** (PPN/PPh) belum dihitung otomatis. Gunakan Jurnal Umum.
 - **Uang muka** ke supplier/customer belum punya alur khusus — catat via Jurnal Umum ke akun 1202.
 - **Transaksi antar unit** belum memakai akun antar-kantor; neraca per unit hanya akurat bila kas dicatat di unit yang benar.

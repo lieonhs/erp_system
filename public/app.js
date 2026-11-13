@@ -31,7 +31,7 @@ function toast(msg, err) {
 const COA_DEFAULT = [
   ['1101', 'Kas', 'asset', true], ['1102', 'Bank', 'asset', true],
   ['1201', 'Piutang Usaha', 'asset'], ['1202', 'Uang Muka / Piutang Lain', 'asset'],
-  ['1301', 'Persediaan Ayam Hidup', 'asset'], ['1302', 'Persediaan Produk Jadi', 'asset'], ['1303', 'Persediaan Bahan Pembantu', 'asset'],
+  ['1301', 'Persediaan Ayam Hidup', 'asset'], ['1302', 'Persediaan Produk Jadi', 'asset'], ['1303', 'Persediaan Bahan Pembantu', 'asset'], ['1304', 'Barang Terkirim Belum Ditagih', 'asset'],
   ['1501', 'Aset Tetap (Mesin, Kendaraan, Bangunan)', 'asset'], ['1502', 'Akumulasi Penyusutan', 'asset'],
   ['2101', 'Hutang Usaha', 'liability'], ['2102', 'Hutang Gaji / Lain-lain', 'liability'], ['2201', 'Hutang Bank', 'liability'],
   ['3101', 'Modal Pemilik', 'equity'], ['3201', 'Prive', 'equity'], ['3301', 'Laba Ditahan', 'equity'],
@@ -109,8 +109,8 @@ const Store = {
     this.localPersist();
   },
 };
-const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', so: 'INV', cash: 'KAS', jv: 'JV' };
-const DATED = new Set(['po', 'gr', 'prod', 'so', 'cash', 'jv']);
+const PREFIX = { po: 'PO', gr: 'GR', prod: 'PRD', do: 'DO', so: 'INV', cash: 'KAS', jv: 'JV' };
+const DATED = new Set(['po', 'gr', 'prod', 'do', 'so', 'cash', 'jv']);
 function localNextNo(kind, date) {
   const ym = (date || localDate()).slice(2, 7).replace('-', '');
   const pre = `${PREFIX[kind]}-${ym}-`;
@@ -128,6 +128,13 @@ function checkLock(kind, date) {
 const S = { recs: [], map: new Map(), unit: 'all', from: '', to: '', E: null, tab: {} };
 const K = k => S.recs.filter(r => r.kind === k);
 const byId = id => S.map.get(id);
+const doIdsOf = inv => (inv.data.dos || []).map(x => x.do_id).filter(Boolean);
+const invoiceOfDO = doId => S.recs.find(r => r.kind === 'so' && doIdsOf(r).includes(doId));
+function nextCode(kind, prefix, extra = []) {
+  let max = 0; const re = new RegExp('^' + prefix + '-(\\d+)$');
+  for (const c of K(kind).map(r => r.data.code).concat(extra)) { const m = re.exec(c || ''); if (m) max = Math.max(max, +m[1]); }
+  return `${prefix}-${String(max + 1).padStart(4, '0')}`;
+}
 const nm = id => { const r = byId(id); return r ? (r.data.name || r.data.plate || r.no || '') : '-'; };
 const inUnit = r => S.unit === 'all' || r.unit_id === S.unit;
 const inPeriod = r => (!S.from || r.date >= S.from) && (!S.to || r.date <= S.to);
@@ -157,7 +164,7 @@ async function reload() {
 
 // ---------- ENGINE: stok, HPP, jurnal ----------
 function engine() {
-  const order = { gr: 0, prod: 1, so: 2 };
+  const order = { gr: 0, prod: 1, do: 2, so: 3 };
   const ev = S.recs.filter(r => r.kind in order).sort((a, b) =>
     (a.date || '').localeCompare(b.date || '') || order[a.kind] - order[b.kind] || (a.created_at || '').localeCompare(b.created_at || ''));
   const stock = new Map(); // unit|item -> {qty, ekor, value}
@@ -215,18 +222,26 @@ function engine() {
       const mainKg = outs.filter(l => itemCat(l.item_id) === 'product').reduce((a, l) => a + num(l.kg), 0);
       cost[r.id] = { liveCost: r2(liveCost), supCost: r2(supCost), overhead, total, outVals, consumed, inKg, inEkor, outKg, mainKg,
         yieldAll: inKg ? outKg / inKg : NaN, yieldMain: inKg ? mainKg / inKg : NaN, costPerKgMain: mainKg ? outVals.filter(o => itemCat(o.item) === 'product').reduce((a, o) => a + o.value, 0) / mainKg : NaN };
+    } else if (r.kind === 'do') {
+      let cogs = 0; const lines = [];
+      for (const l of d.lines || []) { if (!l.item_id) continue; const v = out(r, u, l.item_id, num(l.kg), num(l.ekor)); cogs += v; lines.push({ item: l.item_id, cogs: v }); }
+      cost[r.id] = { cogs: r2(cogs), lines };
     } else if (r.kind === 'so') {
+      const viaDO = doIdsOf(r).length > 0;
       let cogs = 0, total = 0; const lines = [];
       for (const l of d.lines || []) {
         if (!l.item_id) continue;
-        const v = out(r, u, l.item_id, num(l.kg), num(l.ekor));
+        const v = viaDO ? 0 : out(r, u, l.item_id, num(l.kg), num(l.ekor));
         const amt = r2(num(l.kg) * num(l.price));
         cogs += v; total += amt; lines.push({ item: l.item_id, cogs: v, amount: amt });
       }
       const disc = num(d.discount);
-      cost[r.id] = { cogs: r2(cogs), gross: r2(total), total: r2(total - disc), discount: disc, lines };
+      cost[r.id] = { cogs: r2(cogs), gross: r2(total), total: r2(total - disc), discount: disc, lines, viaDO };
     }
   }
+  // Invoice dari DO: HPP = biaya barang yang dikirim di DO terkait
+  for (const r of S.recs) if (r.kind === 'so' && cost[r.id] && cost[r.id].viaDO)
+    cost[r.id].cogs = r2(doIdsOf(r).reduce((a, id) => a + ((cost[id] || {}).cogs || 0), 0));
 
   // ---- Jurnal (GL) ----
   const gl = [];
@@ -245,11 +260,15 @@ function engine() {
       for (const o of c.outVals) J(r, ia(o.item), o.value, 0, 'Hasil potong ' + nm(o.item));
       for (const x of c.consumed) J(r, ia(x.item), 0, x.value, 'Pemakaian ' + nm(x.item));
       J(r, '5202', 0, c.overhead, 'Overhead dibebankan ke produksi');
+    } else if (r.kind === 'do' && c) {
+      J(r, '1304', c.cogs, 0, 'Dikirim ke ' + nm(d.partner_id));
+      for (const l of c.lines) J(r, ia(l.item), 0, l.cogs, 'Keluar ' + nm(l.item));
     } else if (r.kind === 'so' && c) {
       J(r, '1201', c.total, 0, 'Piutang ' + nm(d.partner_id), d.partner_id);
       J(r, '4101', 0, c.gross, 'Penjualan');
       if (c.discount) J(r, '4101', c.discount, 0, 'Potongan penjualan');
-      for (const l of c.lines) { J(r, '5101', l.cogs, 0, 'HPP ' + nm(l.item)); J(r, ia(l.item), 0, l.cogs, 'Keluar ' + nm(l.item)); }
+      if (c.viaDO) { J(r, '5101', c.cogs, 0, 'HPP dari DO'); J(r, '1304', 0, c.cogs, 'DO ditagih'); }
+      else for (const l of c.lines) { J(r, '5101', l.cogs, 0, 'HPP ' + nm(l.item)); J(r, ia(l.item), 0, l.cogs, 'Keluar ' + nm(l.item)); }
     } else if (r.kind === 'cash') {
       const a = num(d.amount), cashAcc = d.account || '1101', memo = d.note || CASH_CAT[d.category];
       switch (d.category) {
@@ -416,7 +435,7 @@ function handleErr(e) { if (e.auth) return askToken(); toast(e.message || String
 // ---------- opsi umum ----------
 const unitOpts = () => units().map(u => [u.id, u.data.name]);
 const itemOpts = cat => () => items(cat).map(i => [i.id, `${i.data.code ? i.data.code + ' · ' : ''}${i.data.name} (${i.data.uom || 'kg'})`]);
-const partnerOpts = t => () => partners(t).map(p => [p.id, p.data.name]);
+const partnerOpts = t => () => partners(t).map(p => [p.id, `${p.data.code ? p.data.code + ' · ' : ''}${p.data.name}${p.data.active === false ? ' (nonaktif)' : ''}`]);
 const accOpts = (f) => () => accounts().filter(a => !f || f(a)).map(a => [a.code, `${a.code} · ${a.name}`]);
 const cashAccOpts = accOpts(a => a.cash);
 const unitField = () => ({ k: 'unit_id', label: 'Unit usaha', type: 'select', options: unitOpts, req: true, def: defaultUnit(), blank: null });
@@ -426,9 +445,9 @@ const NAV = [
   ['Ringkasan', [['dashboard', 'Dashboard']]],
   ['Purchasing', [['po', 'Purchase Order'], ['gr', 'Penerimaan Barang'], ['supplier', 'Kinerja Supplier']]],
   ['Logistik', [['prod', 'Pemotongan / Produksi'], ['stok', 'Stok Persediaan'], ['kartu', 'Kartu Stok'], ['kirim', 'Pengiriman'], ['armada', 'Armada & Driver']]],
-  ['Penjualan', [['so', 'Penjualan / Invoice']]],
+  ['Penjualan', [['do', 'Delivery Order / Surat Jalan'], ['so', 'Invoice Penjualan']]],
   ['Finance', [['kas', 'Kas & Bank'], ['hutang', 'Hutang Supplier'], ['piutang', 'Piutang Customer'], ['jv', 'Jurnal Umum'], ['ledger', 'Buku Besar'], ['lapkeu', 'Laporan Keuangan']]],
-  ['Master', [['barang', 'Barang & Produk'], ['mitra', 'Supplier & Customer'], ['unit', 'Unit Usaha'], ['akun', 'Bagan Akun'], ['setting', 'Pengaturan & Backup']]],
+  ['Master', [['barang', 'Barang & Produk'], ['vendor', 'Vendor / Supplier'], ['customer', 'Customer'], ['unit', 'Unit Usaha'], ['akun', 'Bagan Akun'], ['setting', 'Pengaturan & Backup']]],
 ];
 const PAGES = {};
 const FORMS = {};
@@ -479,7 +498,8 @@ PAGES.dashboard = () => {
   const sd = days.map(d => glF(l => l.date === d && l.acc === '4101').reduce((a, l) => a + l.credit - l.debit, 0));
   const pd = days.map(d => glF(l => l.date === d && l.doc.kind === 'gr' && l.acc === '2101').reduce((a, l) => a + l.credit, 0));
   const mx = Math.max(1, ...sd, ...pd);
-  const pending = K('so').filter(r => inUnit(r) && (r.data.delivery_status || 'pending') !== 'delivered');
+  const pending = K('do').filter(r => inUnit(r) && (r.data.delivery_status || 'pending') !== 'delivered');
+  const unbilled = K('do').filter(r => inUnit(r) && !invoiceOfDO(r.id));
   const openPO = K('po').filter(r => inUnit(r) && poStatus(r)[0] !== 'Selesai' && r.data.status !== 'cancel');
   const ar = bal(['1201']), ap = bal(['2101']);
   const warn = E.warnings.length ? `<div class="alert"><b>Perhatian stok:</b><br>${E.warnings.slice(0, 5).map(esc).join('<br>')}${E.warnings.length > 5 ? `<br>…dan ${E.warnings.length - 5} lainnya` : ''}</div>` : '';
@@ -500,6 +520,7 @@ PAGES.dashboard = () => {
     <div class="card"><h3>Perlu ditindaklanjuti</h3>
       ${table(['Item', ['Jumlah', 1]], [
         `<tr class="click" data-go="kirim"><td>Pengiriman belum selesai</td>${td(pending.length, 1)}</tr>`,
+        `<tr class="click" data-go="do"><td>DO belum dibuatkan invoice</td>${td(unbilled.length ? unbilled.length + ' DO · ' + fmt(unbilled.reduce((a, r) => a + (r.data.lines || []).reduce((x, l) => x + num(l.kg), 0), 0)) + ' kg' : 0, 1)}</tr>`,
         `<tr class="click" data-go="po"><td>PO masih terbuka</td>${td(openPO.length, 1)}</tr>`,
         `<tr class="click" data-go="piutang"><td>Piutang lewat jatuh tempo</td>${td(rp(partners('customer').flatMap(p => aging(p.id, 'so', '1201')).filter(o => bucket(o.due) > 0).reduce((a, o) => a + o.rest, 0)), 1)}</tr>`,
         `<tr class="click" data-go="hutang"><td>Hutang lewat jatuh tempo</td>${td(rp(partners('supplier').flatMap(p => aging(p.id, 'gr', '2101')).filter(o => bucket(o.due) > 0).reduce((a, o) => a + o.rest, 0)), 1)}</tr>`,
@@ -550,9 +571,9 @@ FORMS.po = rec => openForm({
 
 // ---- Penerimaan Barang (GR) ----
 PAGES.gr = () => `<div class="bar"><button data-new="gr">+ Penerimaan</button><span class="sp"></span>${exportBtn('t-gr')}</div>` +
-  table(['No', 'Tanggal', 'Supplier', 'PO', ['Ekor terima', 1], ['Mati', 1], ['Kg kandang', 1], ['Kg terima', 1], ['Susut', 1], ['Nilai', 1], 'Jatuh tempo'], docs('gr').map(r => {
+  table(['No', 'Tanggal', 'Supplier', 'PO', ['Ekor terima', 1], ['Mati', 1], ['Kg kandang', 1], ['Kg terima', 1], ['Susut', 1], ['Nilai', 1], 'Jatuh tempo', 'Cetak'], docs('gr').map(r => {
     const L = r.data.lines || []; const kf = L.reduce((a, l) => a + num(l.kg_farm), 0), kr = L.reduce((a, l) => a + num(l.kg), 0);
-    return `<tr class="click" data-edit="${r.id}"><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.data.partner_id))}</td><td>${esc(r.data.po_id ? (byId(r.data.po_id) || {}).no || '' : '')}</td>${td(fmt(L.reduce((a, l) => a + num(l.ekor), 0), 0), 1)}${td(fmt(L.reduce((a, l) => a + num(l.dead), 0), 0), 1)}${td(fmt(kf), 1)}${td(fmt(kr), 1)}${td(kf ? pct((kf - kr) / kf) : '-', 1)}${td(rp((S.E.cost[r.id] || {}).total), 1)}<td>${esc(r.data.due_date || '')}</td></tr>`;
+    return `<tr class="click" data-edit="${r.id}"><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.data.partner_id))}</td><td>${esc(r.data.po_id ? (byId(r.data.po_id) || {}).no || '' : '')}</td>${td(fmt(L.reduce((a, l) => a + num(l.ekor), 0), 0), 1)}${td(fmt(L.reduce((a, l) => a + num(l.dead), 0), 0), 1)}${td(fmt(kf), 1)}${td(fmt(kr), 1)}${td(kf ? pct((kf - kr) / kf) : '-', 1)}${td(rp((S.E.cost[r.id] || {}).total), 1)}<td>${esc(r.data.due_date || '')}</td><td><button class="ghost sm" onclick="printBTB('${r.id}',false)">Bukti masuk</button></td></tr>`;
   }), { id: 't-gr' }) + `<p class="note">Nilai hutang dihitung dari kg sesuai <i>dasar bayar</i> di tiap penerimaan (timbang kandang atau timbang RPA). Susut & ayam mati masuk ke biaya persediaan.</p>`;
 FORMS.gr = rec => openForm({
   kind: 'gr', title: 'Penerimaan Barang', rec, defaults: { date: localDate(), unit_id: defaultUnit(), pay_basis: 'farm' },
@@ -566,11 +587,17 @@ FORMS.gr = rec => openForm({
       onChange: v => { const p = byId(v); const el = $('#frm').elements['f:due_date']; if (p && num(p.data.terms) && !el.value) el.value = addDays($('#frm').elements['f:date'].value || localDate(), num(p.data.terms)); } },
     { k: 'pay_basis', label: 'Dasar bayar', type: 'select', options: [['farm', 'Timbang kandang (kg kirim)'], ['received', 'Timbang RPA (kg terima)']], blank: null },
     { k: 'due_date', label: 'Jatuh tempo bayar', type: 'date' },
-    { k: 'vehicle', label: 'Kendaraan / sopir', type: 'text' },
+    { k: 'vehicle', label: 'Kendaraan (plat)', type: 'text' },
+    { k: 'driver', label: 'Nama sopir', type: 'text' },
+    { k: 'arrive_time', label: 'Jam tiba', type: 'time' },
+    { k: 'ref_doc', label: 'No. DO / surat jalan supplier', type: 'text' },
+    { k: 'checker', label: 'Diperiksa oleh (gudang/QC)', type: 'text' },
     { k: 'note', label: 'Catatan', type: 'textarea', wide: true },
   ],
+  extraBtn: rec ? `<button type="button" class="ghost" onclick="printBTB('${rec.id}',false)">Cetak Bukti Barang Masuk</button><button type="button" class="ghost" onclick="printBTB('${rec.id}',true)">+ harga</button>` : '',
   tables: [{ k: 'lines', label: 'Rincian timbang', cols: [
     { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(), w: '24%' },
+    { k: 'koli', label: 'Keranjang/koli', type: 'number' },
     { k: 'ekor_farm', label: 'Ekor kirim', type: 'number' }, { k: 'kg_farm', label: 'Kg kandang', type: 'number' },
     { k: 'ekor', label: 'Ekor hidup diterima', type: 'number' }, { k: 'dead', label: 'Mati (DOA)', type: 'number' },
     { k: 'kg', label: 'Kg terima (RPA)', type: 'number' }, { k: 'price', label: 'Harga/kg', type: 'number' },
@@ -655,58 +682,190 @@ PAGES.kartu = () => {
   const mv = S.E.moves.filter(m => m.unit === u && m.item === i);
   return `<div class="bar">${sel}<span class="sp"></span>${exportBtn('t-kartu')}</div>` +
     table(['Tanggal', 'Dokumen', 'Keterangan', ['Masuk', 1], ['Keluar', 1], ['Saldo qty', 1], ['Saldo ekor', 1], ['Nilai mutasi', 1], ['Saldo nilai', 1]], mv.map(m =>
-      `<tr><td>${m.date}</td><td>${esc(m.doc.no)}</td><td>${esc({ gr: 'Penerimaan ' + nm(m.doc.data.partner_id), prod: 'Pemotongan', so: 'Jual ke ' + nm(m.doc.data.partner_id) }[m.doc.kind])}</td>${td(m.qty > 0 ? fmt(m.qty) : '', 1)}${td(m.qty < 0 ? fmt(-m.qty) : '', 1)}${td(fmt(m.balQty), 1)}${td(fmt(m.balEkor, 0), 1)}${td(rp(m.value), 1)}${td(rp(m.balValue), 1)}</tr>`), { id: 't-kartu' });
+      `<tr><td>${m.date}</td><td>${esc(m.doc.no)}</td><td>${esc({ gr: 'Penerimaan ' + nm(m.doc.data.partner_id), prod: 'Pemotongan', do: 'Kirim (DO) ke ' + nm(m.doc.data.partner_id), so: 'Jual langsung ke ' + nm(m.doc.data.partner_id) }[m.doc.kind])}</td>${td(m.qty > 0 ? fmt(m.qty) : '', 1)}${td(m.qty < 0 ? fmt(-m.qty) : '', 1)}${td(fmt(m.balQty), 1)}${td(fmt(m.balEkor, 0), 1)}${td(rp(m.value), 1)}${td(rp(m.balValue), 1)}</tr>`), { id: 't-kartu' });
 };
 
-// ---- Penjualan ----
-PAGES.so = () => `<div class="bar"><button data-new="so">+ Penjualan / Invoice</button><span class="sp"></span>${exportBtn('t-so')}</div>` +
-  table(['No', 'Tanggal', 'Customer', ['Kg', 1], ['Nilai', 1], ['HPP', 1], ['Laba kotor', 1], 'Jatuh tempo', 'Kirim'], docs('so').map(r => {
-    const c = S.E.cost[r.id] || {}; const [dl, dc] = DELIV[r.data.delivery_status || 'pending'];
-    return `<tr class="click" data-edit="${r.id}"><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.data.partner_id))}</td>${td(fmt((r.data.lines || []).reduce((a, l) => a + num(l.kg), 0)), 1)}${td(rp(c.total), 1)}${td(rp(c.cogs), 1)}${td(`<span class="${c.total - c.cogs < 0 ? 'neg' : ''}">${rp(c.total - c.cogs)}</span>`, 1)}<td>${esc(r.data.due_date || '')}</td><td>${badge(dl, dc)}</td></tr>`;
-  }), { id: 't-so' });
-FORMS.so = rec => openForm({
-  kind: 'so', title: 'Penjualan / Invoice', rec, defaults: { date: localDate(), unit_id: defaultUnit(), delivery_status: 'pending' },
+// ---- Delivery Order ----
+const kgOf = r => (r.data.lines || []).reduce((a, l) => a + num(l.kg), 0);
+PAGES.do = () => `<div class="bar"><button data-new="do">+ Delivery Order</button><span class="muted">DO = barang keluar gudang (stok berkurang). Tagihan dibuat terpisah di menu Invoice.</span><span class="sp"></span>${exportBtn('t-do')}</div>` +
+  table(['No DO', 'Tanggal', 'Customer', 'Kendaraan', ['Koli', 1], ['Ekor', 1], ['Kg', 1], 'Status kirim', 'Tagihan', 'Aksi'], docs('do').map(r => {
+    const L = r.data.lines || []; const v = byId(r.data.vehicle_id); const inv = invoiceOfDO(r.id);
+    return `<tr class="click" data-edit="${r.id}"><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.data.partner_id))}</td><td>${v ? esc(v.data.plate) : ''}</td>${td(fmt(L.reduce((a, l) => a + num(l.koli), 0), 0), 1)}${td(fmt(L.reduce((a, l) => a + num(l.ekor), 0), 0), 1)}${td(fmt(kgOf(r)), 1)}<td>${badge(...DELIV[r.data.delivery_status || 'pending'])}</td>
+      <td>${inv ? badge(inv.no, 'b-ok') : badge('Belum ditagih', 'b-warn')}</td>
+      <td><button class="ghost sm" onclick="printSJ('${r.id}')">Surat jalan</button>${inv ? '' : ` <button class="sm" onclick="invoiceFromDO('${r.id}')">Buat invoice</button>`}</td></tr>`;
+  }), { id: 't-do' });
+FORMS.do = rec => openForm({
+  kind: 'do', title: 'Delivery Order / Surat Jalan', rec, defaults: { date: localDate(), unit_id: defaultUnit(), delivery_status: 'pending' },
   fields: [
-    { k: 'date', label: 'Tanggal', type: 'date', req: true }, unitField(),
+    { k: 'date', label: 'Tanggal kirim', type: 'date', req: true }, unitField(),
     { k: 'partner_id', label: 'Customer', type: 'select', options: partnerOpts('customer'), req: true,
-      onChange: v => { const p = byId(v); const el = $('#frm').elements['f:due_date']; if (p && !el.value) el.value = addDays($('#frm').elements['f:date'].value || localDate(), num(p.data.terms)); } },
-    { k: 'due_date', label: 'Jatuh tempo', type: 'date' },
-    { k: 'discount', label: 'Potongan (Rp)', type: 'number' },
-    { k: 'vehicle_id', label: 'Kendaraan', type: 'select', options: () => K('vehicle').map(v => [v.id, `${v.data.plate} · ${v.data.driver || ''}`]) },
-    { k: 'delivery_status', label: 'Status kirim', type: 'select', options: Object.entries(DELIV).map(([k, v]) => [k, v[0]]), blank: null },
+      onChange: v => { const p = byId(v); const el = $('#frm').elements['f:address']; if (p && !el.value) el.value = p.data.ship_address || p.data.address || ''; } },
+    { k: 'cust_po', label: 'No. PO / pesanan customer', type: 'text' },
     { k: 'address', label: 'Alamat kirim', type: 'text' },
+    { k: 'vehicle_id', label: 'Kendaraan', type: 'select', options: () => K('vehicle').map(v => [v.id, `${v.data.plate} · ${v.data.driver || ''}`]) },
+    { k: 'depart_time', label: 'Jam berangkat', type: 'time' },
+    { k: 'temp', label: 'Suhu muatan (°C)', type: 'text', ph: 'mis. -2 s/d 4' },
+    { k: 'seal', label: 'No. segel / catatan muatan', type: 'text' },
+    { k: 'delivery_status', label: 'Status kirim', type: 'select', options: Object.entries(DELIV).map(([k, v]) => [k, v[0]]), blank: null },
     { k: 'note', label: 'Catatan', type: 'textarea', wide: true },
   ],
-  tables: [{ k: 'lines', label: 'Barang dijual', cols: [
-    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(['product', 'byproduct', 'live', 'other']), w: '36%',
-      onChange: (tr, v) => { const it = byId(v); const p = tr.querySelector('[name="l:price"]'); if (it && !num(p.value)) p.value = it.data.price || ''; } },
-    { k: 'ekor', label: 'Ekor (opsional)', type: 'number' }, { k: 'kg', label: 'Kg / Qty', type: 'number' }, { k: 'price', label: 'Harga/kg', type: 'number' },
-    { k: 'sub', label: 'Subtotal', calc: r => rp(r.kg * r.price) },
+  tables: [{ k: 'lines', label: 'Barang dikirim', cols: [
+    { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(['product', 'byproduct', 'live', 'other']), w: '38%' },
+    { k: 'koli', label: 'Koli/box', type: 'number' }, { k: 'ekor', label: 'Ekor', type: 'number' }, { k: 'kg', label: 'Berat kirim (kg/qty)', type: 'number' },
     { k: 'avail', label: 'Stok', calc: (r, h) => { const s = S.E.stock.get((h.unit_id || defaultUnit()) + '|' + r.item_id); return s ? fmt(s.qty) : '-'; } },
   ] }],
-  extraBtn: rec ? `<button type="button" class="ghost" onclick="printSO('${rec.id}','inv')">Cetak Invoice</button><button type="button" class="ghost" onclick="printSO('${rec.id}','sj')">Cetak Surat Jalan</button>` : '',
-  calc: d => { const g = (d.lines || []).reduce((a, l) => a + l.kg * l.price, 0); return `Total invoice: <b>${rp(g - num(d.discount))}</b> · ${fmt((d.lines || []).reduce((a, l) => a + l.kg, 0))} kg`; },
-  validate: d => { if (!(d.lines || []).length) return 'Isi barang yang dijual'; if (d.lines.some(l => !l.item_id || !l.kg)) return 'Setiap baris wajib barang & kg'; },
+  extraBtn: rec ? `<button type="button" class="ghost" onclick="printSJ('${rec.id}')">Cetak Surat Jalan</button>${invoiceOfDO(rec.id) ? '' : `<button type="button" class="ghost" onclick="invoiceFromDO('${rec.id}')">Buat Invoice</button>`}` : '',
+  calc: d => { const L = d.lines || []; return `Total kirim: <b>${fmt(L.reduce((a, l) => a + l.kg, 0))} kg</b> · ${fmt(L.reduce((a, l) => a + l.ekor, 0), 0)} ekor · ${fmt(L.reduce((a, l) => a + l.koli, 0), 0)} koli`; },
+  validate: d => { if (!(d.lines || []).length) return 'Isi barang yang dikirim'; if (d.lines.some(l => !l.item_id || !l.kg)) return 'Setiap baris wajib barang & berat';
+    if (rec && invoiceOfDO(rec.id) && JSON.stringify(rec.data.lines) !== JSON.stringify(d.lines)) return `DO ini sudah ditagih di ${invoiceOfDO(rec.id).no}. Ubah/hapus invoice dulu sebelum mengubah barang.`; },
 });
-window.printSO = (id, type) => {
-  const r = byId(id); if (!r) return; const c = S.E.cost[id] || {}; const cu = byId(r.data.partner_id) || { data: {} }; const u = byId(r.unit_id) || { data: {} };
-  const v = byId(r.data.vehicle_id);
-  const rows = (r.data.lines || []).map((l, i) => `<tr><td>${i + 1}</td><td>${esc(nm(l.item_id))}</td><td style="text-align:right">${fmt(num(l.ekor), 0) || ''}</td><td style="text-align:right">${fmt(num(l.kg))}</td>${type === 'inv' ? `<td style="text-align:right">${rp(l.price)}</td><td style="text-align:right">${rp(num(l.kg) * num(l.price))}</td>` : ''}</tr>`).join('');
-  $('#printArea').innerHTML = `<h2>${type === 'inv' ? 'INVOICE' : 'SURAT JALAN'} — ${esc(u.data.name)}</h2>
-    <p>No: <b>${esc(r.no)}</b> · Tanggal: ${r.date}${type === 'inv' ? ' · Jatuh tempo: ' + esc(r.data.due_date || '-') : ''}<br>Kepada: <b>${esc(cu.data.name)}</b> ${esc(r.data.address || cu.data.address || '')}${v ? `<br>Kendaraan: ${esc(v.data.plate)} · Driver: ${esc(v.data.driver || '')}` : ''}</p>
-    <table><thead><tr><th>#</th><th>Barang</th><th>Ekor</th><th>Kg</th>${type === 'inv' ? '<th>Harga</th><th>Jumlah</th>' : ''}</tr></thead><tbody>${rows}</tbody></table>
-    ${type === 'inv' ? `<p style="text-align:right">${c.discount ? 'Potongan: ' + rp(c.discount) + '<br>' : ''}<b>Total: ${rp(c.total)}</b></p>` : `<br><table><tr><td style="height:70px;width:33%">Pengirim</td><td style="width:33%">Driver</td><td>Penerima</td></tr></table>`}`;
+
+// ---- Invoice ----
+PAGES.so = () => `<div class="bar"><button data-new="so">+ Invoice</button><span class="muted">Tagih dari DO (surat jalan) atau penjualan langsung tanpa DO.</span><span class="sp"></span>${exportBtn('t-so')}</div>` +
+  table(['No', 'Tanggal', 'Customer', 'Dari DO', ['Kg', 1], ['Nilai', 1], ['HPP', 1], ['Laba kotor', 1], 'Jatuh tempo', 'Status bayar', 'Cetak'], docs('so').map(r => {
+    const c = S.E.cost[r.id] || {}; const open = aging(r.data.partner_id, 'so', '1201').find(o => o.r.id === r.id);
+    const st = !open ? ['Lunas', 'b-ok'] : open.rest < c.total - 0.5 ? ['Sebagian', 'b-warn'] : bucket(open.due) > 0 ? ['Jatuh tempo', 'b-bad'] : ['Belum bayar', 'b-info'];
+    return `<tr class="click" data-edit="${r.id}"><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.data.partner_id))}</td><td>${esc(doIdsOf(r).map(id => (byId(id) || {}).no).join(', ') || 'langsung')}</td>${td(fmt(kgOf(r)), 1)}${td(rp(c.total), 1)}${td(rp(c.cogs), 1)}${td(`<span class="${c.total - c.cogs < 0 ? 'neg' : ''}">${rp(c.total - c.cogs)}</span>`, 1)}<td>${esc(r.data.due_date || '')}</td><td>${badge(...st)}</td><td><button class="ghost sm" onclick="printInv('${r.id}')">Invoice</button></td></tr>`;
+  }), { id: 't-so' });
+function rebuildInvoiceLines() {
+  const frm = $('#frm'); const ids = $$('[name="l:do_id"]', frm).map(e => e.value).filter(Boolean);
+  if (!ids.length) return;
+  const prices = {}; for (const tr of $$('[data-line="lines"]', frm)) { const it = tr.querySelector('[name="l:item_id"]').value; const pr = num(tr.querySelector('[name="l:price"]').value); if (it && pr) prices[it] = pr; }
+  const first = byId(ids[0]); if (first) { frm.elements['f:partner_id'].value = first.data.partner_id; frm.elements['f:unit_id'].value = first.unit_id; frm.elements['f:partner_id'].dispatchEvent(new Event('change', { bubbles: true }));
+    if (!frm.elements['f:cust_po'].value && first.data.cust_po) frm.elements['f:cust_po'].value = first.data.cust_po; }
+  const rows = [];
+  for (const id of ids) for (const l of (byId(id) || { data: {} }).data.lines || []) {
+    if (!l.item_id) continue;
+    const ex = rows.find(x => x.item_id === l.item_id);
+    if (ex) { ex.kg = r2(num(ex.kg) + num(l.kg)); ex.ekor = num(ex.ekor) + num(l.ekor); }
+    else rows.push({ item_id: l.item_id, ekor: num(l.ekor) || '', kg: num(l.kg), price: prices[l.item_id] || (byId(l.item_id) || { data: {} }).data.price || '' });
+  }
+  setRows('lines', rows);
+}
+window.invoiceFromDO = id => { FORMS.so(null); const tr = $('[data-line="dos"]'); tr.querySelector('[name="l:do_id"]').value = id; rebuildInvoiceLines(); };
+FORMS.so = rec => openForm({
+  kind: 'so', title: 'Invoice Penjualan', rec, defaults: { date: localDate(), unit_id: defaultUnit() },
+  fields: [
+    { k: 'date', label: 'Tanggal invoice', type: 'date', req: true }, unitField(),
+    { k: 'partner_id', label: 'Customer', type: 'select', options: partnerOpts('customer'), req: true,
+      onChange: v => { const p = byId(v); const el = $('#frm').elements['f:due_date']; if (p && !el.value) el.value = addDays($('#frm').elements['f:date'].value || localDate(), num(p.data.terms)); } },
+    { k: 'cust_po', label: 'No. PO customer', type: 'text' },
+    { k: 'due_date', label: 'Jatuh tempo', type: 'date' },
+    { k: 'discount', label: 'Potongan (Rp)', type: 'number' },
+    { k: 'note', label: 'Catatan', type: 'textarea', wide: true },
+  ],
+  tables: [
+    { k: 'dos', label: '1. DO / surat jalan yang ditagih (kosongkan untuk penjualan langsung)', cols: [
+      { k: 'do_id', label: 'No DO', type: 'select', w: '60%', onChange: () => rebuildInvoiceLines(),
+        options: () => K('do').filter(d => { const inv = invoiceOfDO(d.id); return !inv || (rec && inv.id === rec.id); }).sort((a, b) => b.date.localeCompare(a.date)).map(d => [d.id, `${d.no} · ${d.date} · ${nm(d.data.partner_id)} · ${fmt(kgOf(d))} kg`]) },
+      { k: 'info', label: 'Status kirim', calc: r => { const d = byId(r.do_id); return d ? DELIV[d.data.delivery_status || 'pending'][0] : ''; } } ] },
+    { k: 'lines', label: '2. Barang ditagih (berat & harga bisa disesuaikan dengan timbang penerima)', cols: [
+      { k: 'item_id', label: 'Barang', type: 'select', options: itemOpts(['product', 'byproduct', 'live', 'other']), w: '36%',
+        onChange: (tr, v) => { const it = byId(v); const p = tr.querySelector('[name="l:price"]'); if (it && !num(p.value)) p.value = it.data.price || ''; } },
+      { k: 'ekor', label: 'Ekor', type: 'number' }, { k: 'kg', label: 'Kg / Qty', type: 'number' }, { k: 'price', label: 'Harga/kg', type: 'number' },
+      { k: 'sub', label: 'Subtotal', calc: r => rp(r.kg * r.price) } ] },
+  ],
+  extraBtn: rec ? `<button type="button" class="ghost" onclick="printInv('${rec.id}')">Cetak Invoice</button>` : '',
+  calc: d => {
+    const g = (d.lines || []).reduce((a, l) => a + l.kg * l.price, 0), tot = g - num(d.discount); const kg = (d.lines || []).reduce((a, l) => a + l.kg, 0);
+    const ids = (d.dos || []).map(x => x.do_id).filter(Boolean); const dkg = ids.reduce((a, id) => a + kgOf(byId(id) || { data: {} }), 0);
+    let msg = `Total invoice: <b>${rp(tot)}</b> · ${fmt(kg)} kg`;
+    if (ids.length) msg += ` · berat DO ${fmt(dkg)} kg${Math.abs(dkg - kg) > 0.01 ? ` · <span class="neg">selisih ${fmt(kg - dkg)} kg</span>` : ''}`;
+    else msg += ` · <span class="muted">penjualan langsung: stok dikurangi oleh invoice ini</span>`;
+    const p = byId(d.partner_id); const lim = p ? num(p.data.credit_limit) : 0;
+    if (lim) { const after = partnerBalance(d.partner_id, '1201') - (rec ? (S.E.cost[rec.id] || {}).total || 0 : 0) + tot; if (after > lim) msg += `<br><span class="neg">Piutang customer menjadi ${rp(after)}, melebihi limit kredit ${rp(lim)}.</span>`; }
+    return msg;
+  },
+  validate: d => {
+    if (!(d.lines || []).length) return 'Isi barang yang ditagih'; if (d.lines.some(l => !l.item_id || !l.kg)) return 'Setiap baris wajib barang & kg';
+    const ids = (d.dos || []).map(x => x.do_id).filter(Boolean);
+    if (new Set(ids).size !== ids.length) return 'DO yang sama dipilih dua kali';
+    for (const id of ids) { const x = byId(id); if (x.data.partner_id !== d.partner_id) return `${x.no} milik customer lain`; const inv = invoiceOfDO(id); if (inv && (!rec || inv.id !== rec.id)) return `${x.no} sudah ditagih di ${inv.no}`; }
+  },
+});
+// ---- Dokumen cetak: Surat Jalan, Bukti Barang Masuk, Invoice ----
+function company(unitId) {
+  const c = (byId('setting-company') || { data: {} }).data; const u = byId(unitId) || { data: {} };
+  return { name: c.name || u.data.name || 'Nama Usaha', sub: c.name && u.data.name && u.data.name !== c.name ? u.data.name : '', address: c.address || '', phone: c.phone || '', npwp: c.npwp || '' };
+}
+const tglID = ds => ds ? new Date(ds + 'T00:00:00').toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' }) : '';
+const altNo = (no, pre) => no ? no.replace(/^[A-Z]+/, pre) : '';
+function docHead(co, title, meta) {
+  return `<div class="pd-head"><div><div class="pd-co">${esc(co.name)}</div>${co.sub ? `<div>${esc(co.sub)}</div>` : ''}<div class="pd-small">${esc(co.address)}${co.phone ? ' · Telp ' + esc(co.phone) : ''}${co.npwp ? ' · NPWP ' + esc(co.npwp) : ''}</div></div>
+    <div class="pd-title"><div>${esc(title)}</div><table class="pd-meta">${meta.map(([k, v]) => `<tr><td>${esc(k)}</td><td>: <b>${v}</b></td></tr>`).join('')}</table></div></div>`;
+}
+const docParties = cols => `<div class="pd-parties">${cols.map(([t, lines]) => `<div><div class="pd-lbl">${esc(t)}</div>${lines.filter(Boolean).join('<br>')}</div>`).join('')}</div>`;
+const docSign = names => `<table class="pd-sign"><tr>${names.map(n => `<td>${esc(n)}</td>`).join('')}</tr><tr>${names.map(() => '<td class="pd-space"></td>').join('')}</tr><tr>${names.map(() => '<td>( ............................ )</td>').join('')}</tr></table>`;
+function printDoc(copies) {
+  $('#printArea').innerHTML = copies.map(([label, html]) => `<div class="pdoc">${label ? `<div class="pd-copy">${esc(label)}</div>` : ''}${html}</div>`).join('');
   window.print();
+}
+window.printSJ = id => {
+  const r = byId(id); if (!r) return; const d = r.data; const co = company(r.unit_id);
+  const cu = byId(d.partner_id) || { data: {} }; const v = byId(d.vehicle_id) || { data: {} };
+  const L = (d.lines || []).filter(l => l.item_id);
+  const tot = k => L.reduce((a, l) => a + num(l[k]), 0);
+  const rows = L.map((l, i) => { const it = byId(l.item_id) || { data: {} };
+    return `<tr><td class="c">${i + 1}</td><td>${esc(it.data.code || '')}</td><td>${esc(it.data.name)}</td><td class="c">${esc(it.data.uom || 'kg')}</td><td class="n">${num(l.koli) ? fmt(num(l.koli), 0) : ''}</td><td class="n">${num(l.ekor) ? fmt(num(l.ekor), 0) : ''}</td><td class="n">${fmt(num(l.kg))}</td><td></td><td></td></tr>`; }).join('');
+  const body = docHead(co, 'SURAT JALAN', [['No. SJ / DO', esc(r.no)], ['Tanggal', esc(tglID(r.date))], ['No. PO customer', esc(d.cust_po || '-')]]) +
+    docParties([
+      ['Kirim kepada', [`<b>${esc(cu.data.name)}</b>${cu.data.code ? ' (' + esc(cu.data.code) + ')' : ''}`, esc(d.address || cu.data.address || ''), cu.data.phone ? 'Telp ' + esc(cu.data.phone) : '']],
+      ['Pengangkutan', [`Kendaraan: <b>${esc(v.data.plate || '-')}</b> ${v.data.type ? '(' + esc(v.data.type) + ')' : ''}`, `Sopir: ${esc(v.data.driver || '-')}${v.data.phone ? ' · ' + esc(v.data.phone) : ''}`,
+        `Jam berangkat: ${esc(d.depart_time || '........')}`, `Suhu muatan: ${esc(d.temp || '........')} °C${d.seal ? ' · Segel: ' + esc(d.seal) : ''}`]],
+    ]) +
+    `<table class="pd-tbl"><thead><tr><th>No</th><th>Kode</th><th>Nama barang</th><th>Satuan</th><th>Koli</th><th>Ekor</th><th>Berat kirim (kg)</th><th>Berat diterima (kg)</th><th>Keterangan</th></tr></thead>
+    <tbody>${rows}<tr class="pd-tot"><td colspan="4">TOTAL</td><td class="n">${tot('koli') ? fmt(tot('koli'), 0) : ''}</td><td class="n">${tot('ekor') ? fmt(tot('ekor'), 0) : ''}</td><td class="n">${fmt(tot('kg'))}</td><td></td><td></td></tr></tbody></table>
+    ${d.note ? `<p class="pd-small">Catatan: ${esc(d.note)}</p>` : ''}
+    <p class="pd-small">Mohon barang diperiksa (jumlah, berat, suhu, kondisi) saat diterima. Selisih atau keluhan ditulis di kolom keterangan dan ditandatangani kedua pihak. Klaim setelah surat jalan ditandatangani tanpa catatan tidak dapat diproses.</p>` +
+    docSign(['Dibuat oleh (Admin/Gudang)', 'Sopir / Pengirim', 'Penerima (nama, tgl, jam & cap)']);
+  printDoc([['Lembar 1 — untuk Penerima', body], ['Lembar 2 — Arsip (kembali ke kantor)', body]]);
+};
+window.printBTB = (id, withPrice) => {
+  const r = byId(id); if (!r) return; const d = r.data; const co = company(r.unit_id);
+  const sp = byId(d.partner_id) || { data: {} }; const po = byId(d.po_id);
+  const L = (d.lines || []).filter(l => l.item_id);
+  const tot = k => L.reduce((a, l) => a + num(l[k]), 0);
+  const basis = d.pay_basis === 'farm' ? 'kg_farm' : 'kg';
+  const rows = L.map((l, i) => { const it = byId(l.item_id) || { data: {} }; const su = num(l.kg_farm) ? num(l.kg_farm) - num(l.kg) : 0;
+    return `<tr><td class="c">${i + 1}</td><td>${esc(it.data.code || '')}</td><td>${esc(it.data.name)}</td><td class="n">${num(l.koli) ? fmt(num(l.koli), 0) : ''}</td><td class="n">${num(l.ekor_farm) ? fmt(num(l.ekor_farm), 0) : ''}</td><td class="n">${num(l.kg_farm) ? fmt(num(l.kg_farm)) : ''}</td><td class="n">${num(l.ekor) ? fmt(num(l.ekor), 0) : ''}</td><td class="n">${num(l.dead) ? fmt(num(l.dead), 0) : ''}</td><td class="n">${fmt(num(l.kg))} ${esc(it.data.uom && it.data.uom !== 'kg' ? it.data.uom : '')}</td><td class="n">${num(l.kg_farm) ? fmt(su) + ' (' + pct(su / num(l.kg_farm)) + ')' : ''}</td>${withPrice ? `<td class="n">${rp(l.price)}</td><td class="n">${rp(num(l[basis]) * num(l.price))}</td>` : ''}</tr>`; }).join('');
+  const sk = tot('kg_farm') ? tot('kg_farm') - L.filter(l => num(l.kg_farm)).reduce((a, l) => a + num(l.kg), 0) : 0;
+  const body = docHead(co, 'BUKTI PENERIMAAN BARANG', [['No', esc(altNo(r.no, 'BPB'))], ['Tanggal', esc(tglID(r.date))], ['Jam tiba', esc(d.arrive_time || '-')]]) +
+    docParties([
+      ['Diterima dari', [`<b>${esc(sp.data.name)}</b>${sp.data.code ? ' (' + esc(sp.data.code) + ')' : ''}`, esc(sp.data.address || ''), sp.data.phone ? 'Telp ' + esc(sp.data.phone) : '']],
+      ['Referensi', [`No. PO: ${esc(po ? po.no : '-')}`, `No. DO/SJ supplier: ${esc(d.ref_doc || '-')}`, `Kendaraan: ${esc(d.vehicle || '-')} · Sopir: ${esc(d.driver || '-')}`, `No. sistem: ${esc(r.no)}`]],
+    ]) +
+    `<table class="pd-tbl"><thead><tr><th>No</th><th>Kode</th><th>Nama barang</th><th>Koli</th><th>Ekor kirim</th><th>Kg kandang</th><th>Ekor hidup</th><th>Mati</th><th>Kg diterima</th><th>Susut kg</th>${withPrice ? '<th>Harga/kg</th><th>Jumlah</th>' : ''}</tr></thead>
+    <tbody>${rows}<tr class="pd-tot"><td colspan="3">TOTAL</td><td class="n">${tot('koli') ? fmt(tot('koli'), 0) : ''}</td><td class="n">${tot('ekor_farm') ? fmt(tot('ekor_farm'), 0) : ''}</td><td class="n">${tot('kg_farm') ? fmt(tot('kg_farm')) : ''}</td><td class="n">${tot('ekor') ? fmt(tot('ekor'), 0) : ''}</td><td class="n">${tot('dead') ? fmt(tot('dead'), 0) : ''}</td><td class="n">${fmt(tot('kg'))}</td><td class="n">${tot('kg_farm') ? fmt(sk) + ' (' + pct(sk / tot('kg_farm')) + ')' : ''}</td>${withPrice ? `<td></td><td class="n">${rp((S.E.cost[r.id] || {}).total)}</td>` : ''}</tr></tbody></table>
+    ${withPrice ? `<p class="pd-small">Dasar pembayaran: ${d.pay_basis === 'farm' ? 'timbang kandang' : 'timbang RPA'}. Jatuh tempo: ${esc(tglID(d.due_date) || '-')}.</p>` : ''}
+    ${d.note ? `<p class="pd-small">Catatan: ${esc(d.note)}</p>` : ''}
+    <p class="pd-small">Ditimbang dan dihitung bersama saat bongkar. Ayam mati (DOA) dan susut tercatat di atas disetujui kedua pihak.</p>` +
+    docSign(['Sopir / Pengirim', 'Diterima & diperiksa' + (d.checker ? ' (' + d.checker + ')' : ''), 'Mengetahui']);
+  printDoc(withPrice ? [['Arsip internal', body]] : [['Lembar 1 — untuk Supplier/Sopir', body], ['Lembar 2 — Arsip Gudang', body]]);
+};
+window.printInv = id => {
+  const r = byId(id); if (!r) return; const d = r.data; const co = company(r.unit_id); const c = S.E.cost[id] || {};
+  const cu = byId(d.partner_id) || { data: {} };
+  const L = (d.lines || []).filter(l => l.item_id);
+  const rows = L.map((l, i) => `<tr><td class="c">${i + 1}</td><td>${esc((byId(l.item_id) || { data: {} }).data.code || '')}</td><td>${esc(nm(l.item_id))}</td><td class="n">${num(l.ekor) ? fmt(num(l.ekor), 0) : ''}</td><td class="n">${fmt(num(l.kg))}</td><td class="n">${rp(l.price)}</td><td class="n">${rp(num(l.kg) * num(l.price))}</td></tr>`).join('');
+  const body = docHead(co, 'INVOICE', [['No', esc(r.no)], ['Tanggal', esc(tglID(r.date))], ['Jatuh tempo', esc(tglID(d.due_date) || '-')]]) +
+    docParties([['Ditagihkan kepada', [`<b>${esc(cu.data.name)}</b>`, cu.data.code ? 'Kode: ' + esc(cu.data.code) : '', esc(cu.data.address || ''), cu.data.npwp ? 'NPWP ' + esc(cu.data.npwp) : '']],
+      ['Referensi', [`Surat jalan / DO: ${esc(doIdsOf(r).map(id => (byId(id) || {}).no).join(', ') || '-')}`, `No. PO customer: ${esc(d.cust_po || '-')}`]]]) +
+    `<table class="pd-tbl"><thead><tr><th>No</th><th>Kode</th><th>Barang</th><th>Ekor</th><th>Kg</th><th>Harga/kg</th><th>Jumlah</th></tr></thead><tbody>${rows}
+    <tr><td colspan="6" class="n">Subtotal</td><td class="n">${rp(c.gross)}</td></tr>${c.discount ? `<tr><td colspan="6" class="n">Potongan</td><td class="n">-${rp(c.discount)}</td></tr>` : ''}
+    <tr class="pd-tot"><td colspan="6" class="n">TOTAL</td><td class="n">${rp(c.total)}</td></tr></tbody></table>
+    ${d.note ? `<p class="pd-small">Catatan: ${esc(d.note)}</p>` : ''}${(byId('setting-company') || { data: {} }).data.bank ? `<p class="pd-small">Pembayaran ke: ${esc(byId('setting-company').data.bank)}</p>` : ''}` +
+    docSign(['Hormat kami', 'Diterima oleh']);
+  printDoc([['', body]]);
 };
 
 // ---- Pengiriman ----
 PAGES.kirim = () => {
-  const list = K('so').filter(inUnit).filter(r => (r.data.delivery_status || 'pending') !== 'delivered' || inPeriod(r)).sort((a, b) => b.date.localeCompare(a.date));
+  const list = K('do').filter(inUnit).filter(r => (r.data.delivery_status || 'pending') !== 'delivered' || inPeriod(r)).sort((a, b) => b.date.localeCompare(a.date));
   return `<div class="bar"><span class="muted">Semua pengiriman yang belum selesai + yang terkirim di periode ini</span><span class="sp"></span>${exportBtn('t-kirim')}</div>` +
-    table(['Invoice', 'Tanggal', 'Customer', 'Alamat', 'Kendaraan', ['Kg', 1], 'Status', 'Aksi'], list.map(r => {
+    table(['No DO', 'Tanggal', 'Customer', 'Alamat', 'Kendaraan', ['Kg', 1], 'Status', 'Aksi'], list.map(r => {
       const st = r.data.delivery_status || 'pending'; const v = byId(r.data.vehicle_id); const nx = { pending: 'shipped', shipped: 'delivered' }[st];
       return `<tr><td>${esc(r.no)}</td><td>${r.date}</td><td>${esc(nm(r.data.partner_id))}</td><td>${esc(r.data.address || (byId(r.data.partner_id) || { data: {} }).data.address || '')}</td><td>${v ? esc(v.data.plate + ' · ' + (v.data.driver || '')) : '<span class="muted">belum</span>'}</td>${td(fmt((r.data.lines || []).reduce((a, l) => a + num(l.kg), 0)), 1)}<td>${badge(...DELIV[st])}</td>
-      <td>${nx ? `<button class="sm" data-deliv="${r.id}|${nx}">${nx === 'shipped' ? 'Berangkat' : 'Terkirim'}</button>` : esc(r.data.delivered_at || '')} <button class="ghost sm" onclick="printSO('${r.id}','sj')">Surat jalan</button></td></tr>`;
+      <td>${nx ? `<button class="sm" data-deliv="${r.id}|${nx}">${nx === 'shipped' ? 'Berangkat' : 'Terkirim'}</button>` : esc(r.data.delivered_at || '')} <button class="ghost sm" onclick="printSJ('${r.id}')">Surat jalan</button></td></tr>`;
     }), { id: 't-kirim' });
 };
 async function setDelivery(id, st) {
@@ -715,7 +874,7 @@ async function setDelivery(id, st) {
   try { await Store.save(out); await refresh(); toast('Status pengiriman diperbarui'); } catch (e) { handleErr(e); }
 }
 PAGES.armada = () => {
-  const so = docs('so');
+  const so = docs('do');
   return `<div class="bar"><button data-new="vehicle">+ Kendaraan</button></div>` +
     table(['Plat', 'Jenis', 'Driver', 'No HP', ['Kapasitas (kg)', 1], ['Trip periode ini', 1], ['Kg diantar', 1]], K('vehicle').map(v => {
       const t = so.filter(s => s.data.vehicle_id === v.id);
@@ -893,21 +1052,56 @@ PAGES.barang = () => `<div class="bar"><button data-new="item">+ Barang / produk
   table(['Kode', 'Nama', 'Kategori', 'Satuan', ['Harga jual acuan', 1], 'Unit'], items().map(i =>
     `<tr class="click" data-edit="${i.id}"><td>${esc(i.data.code || '')}</td><td>${esc(i.data.name)}</td><td>${esc(CAT_LABEL[i.data.category] || '')}</td><td>${esc(i.data.uom || 'kg')}</td>${td(i.data.price ? rp(i.data.price) : '', 1)}<td>${esc(i.unit_id ? nm(i.unit_id) : 'Semua')}</td></tr>`), { id: 't-item' }) +
   `<p class="note"><b>Kategori menentukan akun persediaan:</b> ayam hidup → 1301, produk & sampingan → 1302, bahan pembantu → 1303. Harga jual acuan dipakai untuk membagi biaya produksi antar produk.</p>`;
-FORMS.item = rec => openForm({ kind: 'item', title: 'Barang / Produk', rec, defaults: { category: 'product', uom: 'kg' }, fields: [
-  { k: 'code', label: 'Kode' }, { k: 'name', label: 'Nama', req: true },
+FORMS.item = rec => openForm({ kind: 'item', title: 'Barang / Produk', rec, defaults: { category: 'product', uom: 'kg', code: nextCode('item', 'BRG') }, fields: [
+  { k: 'code', label: 'No. barang (otomatis, boleh diubah)', req: true }, { k: 'name', label: 'Nama', req: true },
   { k: 'category', label: 'Kategori', type: 'select', options: Object.entries(CAT_LABEL), blank: null },
   { k: 'uom', label: 'Satuan', type: 'select', options: [['kg', 'kg'], ['ekor', 'ekor'], ['pcs', 'pcs'], ['pack', 'pack'], ['liter', 'liter'], ['balok', 'balok']], blank: null },
   { k: 'price', label: 'Harga jual acuan / satuan (Rp)', type: 'number' },
   { k: 'unit_id', label: 'Khusus unit (kosong = semua)', type: 'select', options: unitOpts, blank: 'Semua unit' },
-  { k: 'note', label: 'Catatan', type: 'textarea', wide: true }] });
+  { k: 'note', label: 'Catatan', type: 'textarea', wide: true }],
+  validate: d => { if (K('item').some(i => i.data.code === d.code && (!rec || i.id !== rec.id))) return `No. barang ${d.code} sudah dipakai`; } });
 
-PAGES.mitra = () => `<div class="bar"><button data-new="partner">+ Supplier / customer</button><span class="sp"></span>${exportBtn('t-mitra')}</div>` +
-  table(['Nama', 'Tipe', 'Telepon', 'Alamat', ['Termin (hari)', 1], ['Hutang', 1], ['Piutang', 1]], K('partner').sort((a, b) => a.data.name.localeCompare(b.data.name)).map(p =>
-    `<tr class="click" data-edit="${p.id}"><td>${esc(p.data.name)}</td><td>${esc({ supplier: 'Supplier', customer: 'Customer', both: 'Keduanya' }[p.data.type])}</td><td>${esc(p.data.phone || '')}</td><td>${esc(p.data.address || '')}</td>${td(fmt(num(p.data.terms), 0), 1)}${td(rp(partnerBalance(p.id, '2101')), 1)}${td(rp(partnerBalance(p.id, '1201')), 1)}</tr>`), { id: 't-mitra' });
-FORMS.partner = rec => openForm({ kind: 'partner', title: 'Supplier / Customer', rec, defaults: { type: 'supplier' }, fields: [
-  { k: 'name', label: 'Nama', req: true }, { k: 'type', label: 'Tipe', type: 'select', options: [['supplier', 'Supplier / peternak'], ['customer', 'Customer'], ['both', 'Keduanya']], blank: null },
-  { k: 'phone', label: 'Telepon' }, { k: 'terms', label: 'Termin bayar (hari)', type: 'number' }, { k: 'npwp', label: 'NPWP (opsional)' },
-  { k: 'address', label: 'Alamat', type: 'textarea', wide: true }] });
+const VENDOR_CAT = [['peternak', 'Peternak / ayam hidup'], ['bahan', 'Bahan pembantu (es, plastik, gas)'], ['jasa', 'Jasa (transport, perbaikan)'], ['lain', 'Lainnya']];
+const CUST_CAT = [['pasar', 'Pedagang pasar'], ['resto', 'Rumah makan / katering'], ['retail', 'Retail / supermarket'], ['distributor', 'Distributor / agen'], ['lain', 'Lainnya']];
+function partnerPage(type) {
+  const isV = type === 'supplier'; const list = partners(type).sort((a, b) => (a.data.code || '').localeCompare(b.data.code || '') || a.data.name.localeCompare(b.data.name));
+  const head = isV ? ['No. vendor', 'Nama', 'Kategori', 'Kontak', 'Telepon', 'Rekening', ['Termin', 1], ['Saldo hutang', 1], 'Status']
+    : ['No. customer', 'Nama', 'Segmen', 'Kontak', 'Telepon', ['Termin', 1], ['Limit kredit', 1], ['Saldo piutang', 1], 'Status'];
+  return `<div class="bar"><button data-new="${isV ? 'vendor' : 'customer'}">+ ${isV ? 'Vendor' : 'Customer'}</button><span class="sp"></span>${exportBtn('t-' + type)}</div>` +
+    table(head, list.map(p => { const d = p.data; const cat = Object.fromEntries(isV ? VENDOR_CAT : CUST_CAT)[d.category] || '';
+      const bal = partnerBalance(p.id, isV ? '2101' : '1201'); const st = d.active === false ? badge('Nonaktif') : badge('Aktif', 'b-ok');
+      return `<tr class="click" data-edit="${p.id}"><td>${esc(d.code || '')}</td><td>${esc(d.name)}${d.type === 'both' ? ' ' + badge('vendor+customer', 'b-info') : ''}</td><td>${esc(cat)}</td><td>${esc(d.contact || '')}</td><td>${esc(d.phone || '')}</td>` +
+        (isV ? `<td>${esc([d.bank_name, d.bank_acc].filter(Boolean).join(' '))}</td>${td(fmt(num(d.terms), 0) + ' hr', 1)}${td(rp(bal), 1)}`
+             : `${td(fmt(num(d.terms), 0) + ' hr', 1)}${td(d.credit_limit ? rp(d.credit_limit) : '-', 1)}${td(`<span class="${d.credit_limit && bal > d.credit_limit ? 'neg' : ''}">${rp(bal)}</span>`, 1)}`) + `<td>${st}</td></tr>`;
+    }), { id: 't-' + type });
+}
+PAGES.vendor = () => partnerPage('supplier');
+PAGES.customer = () => partnerPage('customer');
+FORMS.partner = (rec, preset) => {
+  const type = rec ? rec.data.type : preset; const isV = type !== 'customer';
+  const pre = isV ? 'V' : 'C';
+  const common = [
+    { k: 'code', label: `No. ${isV ? 'vendor' : 'customer'} (otomatis, boleh diubah)`, req: true }, { k: 'name', label: 'Nama', req: true },
+    { k: 'type', label: 'Tipe', type: 'select', options: [['supplier', 'Vendor / supplier'], ['customer', 'Customer'], ['both', 'Vendor sekaligus customer']], blank: null },
+    { k: 'category', label: isV ? 'Kategori vendor' : 'Segmen customer', type: 'select', options: isV ? VENDOR_CAT : CUST_CAT },
+    { k: 'contact', label: 'Nama kontak / PIC' }, { k: 'phone', label: 'Telepon / WA' }, { k: 'email', label: 'Email' }, { k: 'npwp', label: 'NPWP' },
+    { k: 'terms', label: 'Termin bayar (hari)', type: 'number' },
+  ];
+  const vend = [{ k: 'bank_name', label: 'Bank' }, { k: 'bank_acc', label: 'No. rekening' }, { k: 'bank_holder', label: 'Atas nama rekening' }];
+  const cust = [{ k: 'credit_limit', label: 'Limit kredit (Rp)', type: 'number' }];
+  openForm({ kind: 'partner', title: isV ? 'Master Vendor' : 'Master Customer', rec,
+    defaults: { type: preset || 'supplier', code: nextCode('partner', pre), terms: isV ? 7 : 14 },
+    fields: [...common, ...(isV ? vend : cust),
+      { k: 'active', label: 'Aktif', type: 'checkbox', def: true },
+      { k: 'address', label: isV ? 'Alamat' : 'Alamat penagihan', type: 'textarea', wide: true },
+      ...(isV ? [] : [{ k: 'ship_address', label: 'Alamat kirim (bila beda)', type: 'textarea', wide: true }]),
+      { k: 'note', label: 'Catatan', type: 'textarea', wide: true }],
+    canDelete: !rec || !S.recs.some(r => r.data && r.data.partner_id === rec.id),
+    validate: d => { if (K('partner').some(p => p.data.code === d.code && (!rec || p.id !== rec.id))) return `No. ${d.code} sudah dipakai`; },
+  });
+};
+FORMS.vendor = () => FORMS.partner(null, 'supplier');
+FORMS.customer = () => FORMS.partner(null, 'customer');
 
 PAGES.unit = () => `<div class="bar"><button data-new="unit">+ Unit usaha</button><span class="muted">Tambah unit untuk ekspansi (mis. distribusi daging, pakan, peternakan, frozen food). Semua modul otomatis bisa dipakai per unit.</span></div>` +
   table(['Kode', 'Nama', 'Keterangan', ['Transaksi', 1]], units().map(u => `<tr class="click" data-edit="${u.id}"><td>${esc(u.data.code || '')}</td><td>${esc(u.data.name)}</td><td>${esc(u.data.desc || '')}</td>${td(S.recs.filter(r => r.unit_id === u.id && DATED.has(r.kind)).length, 1)}</tr>`));
@@ -929,6 +1123,11 @@ PAGES.setting = () => {
   return `<div class="grid2"><div class="card"><h3>Mode penyimpanan</h3>
     <p>${Store.mode === 'cloud' ? '<span class="badge b-ok">Cloudflare D1</span> Data tersimpan di database server dan bisa diakses semua perangkat.' : '<span class="badge b-warn">Demo lokal</span> Data hanya tersimpan di browser ini. Deploy ke Cloudflare agar data aman & bisa dipakai bersama.'}</p>
     ${Store.mode === 'cloud' && Store.needAuth ? '<button class="ghost" id="tokenBtn">Ganti token akses</button>' : ''}</div>
+  <div class="card"><h3>Kop dokumen (surat jalan, bukti masuk, invoice)</h3>
+    ${(() => { const c = (byId('setting-company') || { data: {} }).data; return `<div class="fgrid" id="coForm">
+      <label>Nama usaha<input id="co_name" value="${esc(c.name || '')}"></label><label>Telepon<input id="co_phone" value="${esc(c.phone || '')}"></label>
+      <label>NPWP<input id="co_npwp" value="${esc(c.npwp || '')}"></label><label>Rekening pembayaran<input id="co_bank" value="${esc(c.bank || '')}" placeholder="BCA 123xxx a.n. ..."></label>
+      <label class="wide">Alamat<input id="co_address" value="${esc(c.address || '')}"></label></div><button id="coBtn">Simpan kop</button>`; })()}</div>
   <div class="card"><h3>Tutup buku (kunci periode)</h3><p class="muted">Transaksi bertanggal sampai tanggal ini tidak bisa ditambah/diubah/dihapus.</p>
     <div class="bar"><input type="date" id="lockInp" value="${esc(l)}"><button id="lockBtn">Simpan kunci</button></div></div>
   <div class="card"><h3>Backup & restore</h3><p class="muted">Simpan backup rutin (mingguan). File JSON berisi seluruh data.</p>
@@ -943,7 +1142,8 @@ async function seedMaster() {
     ['CKR', 'Ceker', 'byproduct', 'kg', 0], ['KPL', 'Kepala & Leher', 'byproduct', 'kg', 0], ['USS', 'Usus', 'byproduct', 'kg', 0],
     ['BL', 'Bulu / Limbah', 'byproduct', 'kg', 0], ['ES', 'Es Balok', 'supplies', 'balok', 0], ['PLS', 'Plastik Kemasan', 'supplies', 'pack', 0],
   ];
-  for (const [code, name, category, uom, price] of list) if (!have.has(name.toLowerCase())) await Store.save({ kind: 'item', data: { code, name, category, uom, price } });
+  const used = [];
+  for (const [, name, category, uom, price] of list) if (!have.has(name.toLowerCase())) { const code = nextCode('item', 'BRG', used); used.push(code); await Store.save({ kind: 'item', data: { code, name, category, uom, price } }); }
   toast('Master contoh ditambahkan. Isi harga jual acuan tiap produk di menu Barang.');
   await refresh();
 }
@@ -985,6 +1185,12 @@ document.addEventListener('click', async e => {
   if (t.id === 'menuBtn') return $('#side').classList.toggle('open');
   if (t.id === 'seedBtn') return seedMaster().catch(handleErr);
   if (t.id === 'tokenBtn') return askToken();
+  if (t.id === 'coBtn') {
+    const prev = byId('setting-company'); const data = {};
+    for (const k of ['name', 'phone', 'npwp', 'bank', 'address']) data[k] = $('#co_' + k).value.trim();
+    try { await Store.save({ ...(prev || {}), id: 'setting-company', kind: 'setting', data }); toast('Kop dokumen disimpan'); await refresh(); } catch (err) { handleErr(err); }
+    return;
+  }
   if (t.id === 'lockBtn') {
     const v = $('#lockInp').value; const prev = byId('setting-lock');
     try { await Store.save({ ...(prev || {}), id: 'setting-lock', kind: 'setting', data: { lock_date: v } }); toast(v ? 'Periode dikunci s/d ' + v : 'Kunci dibuka'); await refresh(); } catch (err) { handleErr(err); }
