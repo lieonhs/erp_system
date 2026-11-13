@@ -1,7 +1,7 @@
 # ERP RPA — Finance, Purchasing & Logistik
 
 Web app untuk usaha pemotongan ayam (RPA), bisa dipakai untuk unit usaha lain.
-Hosting: **Cloudflare Pages** (frontend + API) + **Cloudflare D1** (database SQL). Paket gratis Cloudflare cukup untuk usaha kecil–menengah.
+Hosting: **Cloudflare Workers** (frontend + API) + **Cloudflare D1** (database SQL). Paket gratis Cloudflare cukup untuk usaha kecil–menengah.
 
 ## Modul
 | Area | Isi |
@@ -14,26 +14,28 @@ Hosting: **Cloudflare Pages** (frontend + API) + **Cloudflare D1** (database SQL
 
 Semua jurnal dibuat otomatis dari transaksi. Edit transaksi → stok, HPP, jurnal, dan laporan ikut terhitung ulang.
 
-## Deploy (sekali, ±15 menit)
-Butuh: akun Cloudflare (gratis) dan Node.js 18+.
+## Deploy (Cloudflare Workers + D1)
+Database D1 `erp-rpa-db` sudah dibuat dan ID-nya ada di `wrangler.toml`.
 
+**Lewat GitHub (otomatis):** Workers & Pages → Worker `erp-system` → Settings → Build → hubungkan repo ini.
+Deploy command: `npx wrangler deploy` (default). Setiap push ke `main` = deploy ulang.
+
+**Manual dari komputer:**
 ```bash
 npm install
 npx wrangler login
-npx wrangler d1 create erp-rpa-db
-#  -> salin "database_id" yang muncul ke wrangler.toml
-npm run db:init:remote
-npx wrangler pages project create erp-rpa --production-branch main
 npm run deploy
 ```
-Hasilnya alamat seperti `https://erp-rpa.pages.dev`.
+Alamat: `https://erp-system.<subdomain-akun>.workers.dev`
+
+Membuat database baru dari nol: `npx wrangler d1 create erp-rpa-db`, salin ID ke `wrangler.toml`, lalu `npm run db:init:remote`.
 
 ### Wajib: kunci akses
 Tanpa ini, siapa pun yang tahu alamatnya bisa melihat & mengubah data.
-1. **Cloudflare Access (disarankan)**: Dashboard → Zero Trust → Access → Applications → Add → Self-hosted → domain `erp-rpa.pages.dev` → policy "Emails" berisi email tim. Gratis s/d 50 user. Email user otomatis tercatat di jejak audit.
+1. **Cloudflare Access (disarankan)**: Dashboard → Zero Trust → Access → Applications → Add → Self-hosted → domain `erp-system.<subdomain>.workers.dev` → policy "Emails" berisi email tim. Gratis s/d 50 user. Email user otomatis tercatat di jejak audit.
 2. **Tambahan / alternatif cepat** — token bersama:
    ```bash
-   npx wrangler pages secret put APP_TOKEN   # isi kata sandi panjang
+   npx wrangler secret put APP_TOKEN   # isi kata sandi panjang
    npm run deploy
    ```
    Aplikasi akan meminta token saat dibuka.
@@ -42,7 +44,7 @@ Tanpa ini, siapa pun yang tahu alamatnya bisa melihat & mengubah data.
 ```bash
 npm install
 npm run db:init:local
-npm run dev        # buka http://localhost:8788
+npm run dev        # buka http://localhost:8787
 ```
 Membuka `public/index.html` langsung (tanpa server) = **mode demo**: data hanya di browser itu.
 
@@ -67,7 +69,9 @@ Tambah **Unit Usaha** (mis. distribusi frozen food, pakan, peternakan). Barang, 
 ## Struktur
 ```
 public/            frontend (HTML/CSS/JS murni, tanpa build)
-functions/api/     API (Cloudflare Pages Functions)
+src/worker.js      entry Worker: /api/* -> API, sisanya file statis
+src/api.js         logika API + D1
+functions/api/     adapter bila suatu saat dipindah ke Cloudflare Pages
 schema.sql         skema D1 (records + audit)
 wrangler.toml      konfigurasi Cloudflare
 ```

@@ -6,8 +6,8 @@
   "scripts": {
     "db:init:local": "wrangler d1 execute erp-rpa-db --local --file=schema.sql",
     "db:init:remote": "wrangler d1 execute erp-rpa-db --remote --file=schema.sql",
-    "dev": "wrangler pages dev",
-    "deploy": "wrangler pages deploy"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4"

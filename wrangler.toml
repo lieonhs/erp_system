@@ -1,9 +1,14 @@
-name = "erp-rpa"
-pages_build_output_dir = "public"
+# Cloudflare Workers (static assets + API + D1)
+name = "erp-system"
+main = "src/worker.js"
 compatibility_date = "2026-11-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
 
 [[d1_databases]]
 binding = "DB"
 database_name = "erp-rpa-db"
-# D1 production (APAC)
 database_id = "5888b9ac-35c5-4858-986b-8854ead1271e"
